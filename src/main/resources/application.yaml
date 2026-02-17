@@ -1,0 +1,55 @@
+# 占位符 ${VAR} 会从：1）系统环境变量 2）启动前从项目根目录 .env 加载的系统属性 中解析
+server:
+  port: 8093
+
+spring:
+  application:
+    name: AstroGuide
+  # 数据源（环境变量见 .env.example）
+  datasource:
+    url: jdbc:mysql://${DB_HOST:localhost}:${DB_PORT:3306}/${DB_NAME:astroguide}?useUnicode=true&characterEncoding=utf-8&useSSL=false&serverTimezone=Asia/Shanghai
+    username: ${DB_USERNAME:root}
+    password: ${DB_PASSWORD:}
+
+  # Spring AI OpenAI（兼容 OpenAI / DeepSeek / 硅基流动 等，环境变量见 .env）
+  ai:
+    openai:
+      api-key: ${OPENAI_API_KEY}
+      base-url: ${OPENAI_BASE_URL:https://api.deepseek.com}
+      chat:
+        options:
+          model: ${OPENAI_CHAT_MODEL:deepseek-chat}
+          temperature: 0.7
+          max-tokens: 2000
+      # Embedding 用于 RAG 向量检索；可单独指定 base-url/model/key，对接硅基流动等 OpenAI 兼容接口
+      # 硅基流动：base-url=https://api.siliconflow.cn/v1，model 如 BAAI/bge-large-zh-v1.5（1024 维）或 Qwen/Qwen3-Embedding-0.6B
+      embedding:
+        api-key: ${OPENAI_EMBEDDING_API_KEY:${OPENAI_API_KEY}}
+        base-url: ${OPENAI_EMBEDDING_BASE_URL:https://api.siliconflow.cn/v1}
+        options:
+          model: ${OPENAI_EMBEDDING_MODEL:Qwen/Qwen3-Embedding-4B}
+    # Qdrant 向量库（V1 RAG）；Docker 部署时 host/port 指向 Qdrant 服务（gRPC 端口 6334）
+    vectorstore:
+      qdrant:
+        host: ${QDRANT_HOST:36.138.238.148}
+        port: ${QDRANT_PORT:6334}
+        collection-name: ${QDRANT_COLLECTION:astro_knowledge}
+        # 启动时若 collection 不存在则自动创建（需配合 EmbeddingModel 维度）
+        initialize-schema: ${QDRANT_INITIALIZE_SCHEMA:true}
+
+# Concept Card：未命中时是否调用 LLM 生成并缓存（默认 false，仅查缓存）
+app:
+  concept-card:
+    generate-on-miss: false
+  # 工具调用：仅使用 Spring AI @Tool + .tools()，由 ChatModel 托管 tool 执行与多轮回填（无自研 agent 循环）
+  ai:
+    tools:
+      enabled: ${APP_AI_TOOLS_ENABLED:true}
+  # RAG 知识库（V1）：开关与检索参数
+  rag:
+    enabled: ${RAG_ENABLED:false}
+    top-k: ${RAG_TOP_K:8}
+    wikipedia-on-demand:
+      enabled: ${RAG_WIKIPEDIA_ENABLED:false}
+      max-results: ${RAG_WIKIPEDIA_MAX_RESULTS:4}
+      max-chars-per-result: ${RAG_WIKIPEDIA_MAX_CHARS:1000}
