@@ -79,6 +79,31 @@
 - `app.rag.enabled`：启用/禁用 RAG 顾问
 - `app.rag.wikipedia-on-demand.enabled`：当工具禁用时启用维基百科顾问
 
+## 用户主动调用工具（确定性触发）
+
+除了“用户只打字，模型自动决定是否调用工具”的自动模式外，AstroGuide 还支持用户用非常轻量的前缀来**主动、确定性地触发指定工具**。
+
+当一条用户消息以指令前缀开头时，后端会：
+- 先执行对应工具（Wikipedia / 知识库 / 概念卡）进行预取
+- 将检索/查询结果作为参考内容注入 prompt
+- 在配置允许的前提下，仍保留自动 tool calling，使模型在同一轮里可以继续调用其它工具
+- 仅对“已被显式触发的那个工具”做单次禁用（避免重复调用同一个工具）
+
+支持的指令：
+
+- `@wiki: <query>`
+  - 示例：`@wiki: black hole`
+
+- `@kb: <query> [topk=<n>]`
+  - 示例：`@kb: 钱德拉塞卡极限 topk=5`
+
+- `@card: <payload>`
+  - 简写示例：
+    - `@card: 黑洞`
+    - `@card: term zh 黑洞`
+  - 键值对示例：
+    - `@card: type=term lang=zh text="黑洞"`
+
 ## 项目结构
 
 ```

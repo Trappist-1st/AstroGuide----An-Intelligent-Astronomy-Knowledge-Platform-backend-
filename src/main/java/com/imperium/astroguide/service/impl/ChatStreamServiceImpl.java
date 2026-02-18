@@ -87,7 +87,10 @@ public class ChatStreamServiceImpl implements ChatStreamService {
                                                              Integer maxCompletionTokens,
                                                              boolean ragEnabled,
                                                              boolean wikipediaOnDemandEnabled,
-                                     boolean toolCallingEnabled,
+                                                             boolean toolCallingEnabled,
+                                                             boolean wikipediaToolEnabled,
+                                                             boolean knowledgeBaseToolEnabled,
+                                                             boolean conceptCardToolEnabled,
                                                              Map<String, Object> advisorParams) {
         var promptSpec = chatClient.prompt()
                 .system(systemPrompt)
@@ -125,7 +128,19 @@ public class ChatStreamServiceImpl implements ChatStreamService {
         }
 
         if (toolCallingEnabled) {
-            promptSpec = promptSpec.tools(wikipediaTool, knowledgeBaseTool, conceptCardTool);
+            List<Object> tools = new ArrayList<>();
+            if (wikipediaToolEnabled) {
+                tools.add(wikipediaTool);
+            }
+            if (knowledgeBaseToolEnabled) {
+                tools.add(knowledgeBaseTool);
+            }
+            if (conceptCardToolEnabled) {
+                tools.add(conceptCardTool);
+            }
+            if (!tools.isEmpty()) {
+                promptSpec = promptSpec.tools(tools.toArray());
+            }
         }
 
         return promptSpec.stream().chatClientResponse();

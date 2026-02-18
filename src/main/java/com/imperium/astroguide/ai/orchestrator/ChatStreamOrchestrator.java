@@ -2,7 +2,11 @@ package com.imperium.astroguide.ai.orchestrator;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.imperium.astroguide.ai.advisor.WikipediaOnDemandAdvisor;
+import com.imperium.astroguide.ai.tools.ConceptCardTool;
+import com.imperium.astroguide.ai.tools.KnowledgeBaseTool;
+import com.imperium.astroguide.ai.tools.WikipediaTool;
 import com.imperium.astroguide.model.dto.rag.CitationDto;
+import com.imperium.astroguide.model.dto.rag.RagRetrieveResult;
 import com.imperium.astroguide.model.entity.Conversation;
 import com.imperium.astroguide.model.entity.Message;
 import com.imperium.astroguide.policy.ContextTrimPolicy;
@@ -24,6 +28,7 @@ import org.springframework.beans.factory.annotation.Value;
 import org.springframework.http.codec.ServerSentEvent;
 import org.springframework.stereotype.Service;
 import reactor.core.publisher.Flux;
+import reactor.core.publisher.Mono;
 import reactor.core.scheduler.Schedulers;
 
 import java.util.ArrayList;
@@ -33,6 +38,8 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.UUID;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 @Service
 public class ChatStreamOrchestrator {
@@ -51,6 +58,10 @@ public class ChatStreamOrchestrator {
     private final ObjectMapper objectMapper;
     private final ChatMemory chatMemory;
     private final ChatMemoryPrimeTracker chatMemoryPrimeTracker;
+
+    private final WikipediaTool wikipediaTool;
+    private final KnowledgeBaseTool knowledgeBaseTool;
+    private final ConceptCardTool conceptCardTool;
 
     @Value("${spring.ai.openai.chat.options.model:deepseek-chat}")
     private String defaultModel;
@@ -76,7 +87,10 @@ public class ChatStreamOrchestrator {
                                  RateLimitPolicy rateLimitPolicy,
                                  ObjectMapper objectMapper,
                                  ChatMemory chatMemory,
-                                 ChatMemoryPrimeTracker chatMemoryPrimeTracker) {
+                                 ChatMemoryPrimeTracker chatMemoryPrimeTracker,
+                                 WikipediaTool wikipediaTool,
+                                 KnowledgeBaseTool knowledgeBaseTool,
+                                 ConceptCardTool conceptCardTool) {
         this.conversationService = conversationService;
         this.messageService = messageService;
         this.chatStreamService = chatStreamService;
@@ -85,6 +99,9 @@ public class ChatStreamOrchestrator {
         this.objectMapper = objectMapper;
         this.chatMemory = chatMemory;
         this.chatMemoryPrimeTracker = chatMemoryPrimeTracker;
+        this.wikipediaTool = wikipediaTool;
+        this.knowledgeBaseTool = knowledgeBaseTool;
+        this.conceptCardTool = conceptCardTool;
     }
 
     public Flux<ServerSentEvent<String>> stream(String conversationId,
@@ -123,11 +140,6 @@ public class ChatStreamOrchestrator {
         // 将历史消息写入 ChatMemory（仍以 MySQL 为权威来源；ChatMemory 仅用于注入 prompt 上下文）
         primeChatMemoryFromDb(conversationId, userMessage);
 
-        boolean toolCallingEnabled = toolsEnabled;
-        boolean wikipediaAdvisorEnabledForRun = wikipediaOnDemandEnabled && !toolCallingEnabled;
-
-        boolean hasReference = ragEnabled || wikipediaOnDemandEnabled || toolCallingEnabled;
-        String systemPrompt = buildSystemPrompt(difficulty, language, hasReference);
         int maxTokens = OutputLimitPolicy.getMaxCompletionTokens(difficulty);
         String requestId = "req_" + UUID.randomUUID().toString().replace("-", "").substring(0, 16);
 
@@ -154,73 +166,352 @@ public class ChatStreamOrchestrator {
         AtomicReference<List<Document>> ragDocsRef = new AtomicReference<>();
         AtomicReference<List<Document>> wikiDocsRef = new AtomicReference<>();
 
-        Map<String, Object> advisorParams = new HashMap<>();
-        advisorParams.put(WikipediaOnDemandAdvisor.ORIGINAL_QUERY, userQuestion);
-
         return metaFlux.concatWith(Flux.defer(() -> {
             // prompt token 估算：system + 当前 user + ChatMemory 历史（由 MemoryAdvisor 注入）
             int memoryCharsEst = estimateChatMemoryChars(conversationId);
 
-            Flux<ChatClientResponse> responseFlux = chatStreamService
-                .streamChatClientResponses(conversationId, systemPrompt, userQuestion, defaultModel, maxTokens,
-                    ragEnabled, wikipediaAdvisorEnabledForRun, toolCallingEnabled, advisorParams)
-                .doOnNext(r -> captureRetrievedDocuments(r, ragDocsRef, wikiDocsRef));
+            return Mono.fromCallable(() -> resolveManualDirective(userQuestion, language))
+                .subscribeOn(Schedulers.boundedElastic())
+                .flatMapMany(manual -> {
+                    String effectiveUserText = manual.augmentedUserText != null ? manual.augmentedUserText : userQuestion;
 
-            Flux<ServerSentEvent<String>> deltaFlux = responseFlux
-                .map(ChatStreamOrchestrator::extractDeltaText)
-                .filter(s -> s != null && !s.isBlank())
-                .doOnNext(contentAccumulator::append)
-                .map(chunk -> toJson(Map.of("text", chunk)))
-                .map(data -> ServerSentEvent.<String>builder(data).event("delta").build());
+                    boolean toolCallingEnabled = toolsEnabled;
+                    boolean ragEnabledForRun = ragEnabled;
 
-            Flux<ServerSentEvent<String>> doneFlux = Flux.defer(() -> {
-            int latencyMs = (int) (System.currentTimeMillis() - startMs);
-            int promptTokensEst = estimateTokens(systemPrompt.length() + userQuestion.length() + memoryCharsEst);
-            int completionTokensEst = estimateTokens(contentAccumulator.length());
-            double costUsd = estimateCostUsd(promptTokensEst, completionTokensEst);
-            Map<String, Object> donePayload = new HashMap<>(Map.of(
-                "status", "done",
-                "usage", Map.of(
-                    "promptTokens", promptTokensEst,
-                    "completionTokens", completionTokensEst,
-                    "estimatedCostUsd", costUsd
-                )
-            ));
+                    // If user explicitly requested KB retrieval, we already injected references; skip auto RAG advisor to avoid duplicate retrieval cost.
+                    if (manual.enabled && manual.tool == ManualTool.KB) {
+                        ragEnabledForRun = false;
+                    }
 
-            List<CitationDto> citations = mergeCitations(ragDocsRef.get(), wikiDocsRef.get());
-            if (citations != null && !citations.isEmpty()) {
-                List<Map<String, String>> citationMaps = new ArrayList<>();
-                for (CitationDto c : citations) {
-                citationMaps.add(Map.of(
-                    "chunkId", c.getChunkId() != null ? c.getChunkId() : "",
-                    "source", c.getSource() != null ? c.getSource() : "",
-                    "excerpt", c.getExcerpt() != null ? c.getExcerpt() : ""
-                ));
-                }
-                donePayload.put("citations", citationMaps);
+                    boolean wikipediaAdvisorEnabledForRun = wikipediaOnDemandEnabled && !toolCallingEnabled;
+
+                    // Manual directive mode: deterministic prefetch + inject reference.
+                    // Keep tool calling enabled (if configured) so the model can still call OTHER tools in the same run.
+                    if (manual.enabled) {
+                        if (manual.ragDocs != null && !manual.ragDocs.isEmpty()) {
+                            ragDocsRef.set(manual.ragDocs);
+                        }
+                        if (manual.wikiDocs != null && !manual.wikiDocs.isEmpty()) {
+                            wikiDocsRef.set(manual.wikiDocs);
+                        }
+                    }
+
+                    boolean wikipediaToolEnabledForRun = true;
+                    boolean knowledgeBaseToolEnabledForRun = true;
+                    boolean conceptCardToolEnabledForRun = true;
+                    if (manual.enabled) {
+                        // Avoid re-invoking the same tool that was explicitly requested.
+                        if (manual.tool == ManualTool.WIKI) {
+                            wikipediaToolEnabledForRun = false;
+                        } else if (manual.tool == ManualTool.KB) {
+                            knowledgeBaseToolEnabledForRun = false;
+                        } else if (manual.tool == ManualTool.CARD) {
+                            conceptCardToolEnabledForRun = false;
+                        }
+                    }
+
+                    boolean hasReference = ragEnabledForRun || wikipediaAdvisorEnabledForRun || toolCallingEnabled
+                        || (manual.enabled && manual.hasReference);
+                    String systemPrompt = buildSystemPrompt(difficulty, language, hasReference);
+
+                    Map<String, Object> advisorParams = new HashMap<>();
+                    advisorParams.put(WikipediaOnDemandAdvisor.ORIGINAL_QUERY,
+                        manual.cleanedUserText != null ? manual.cleanedUserText : userQuestion);
+
+                    Flux<ChatClientResponse> responseFlux = chatStreamService
+                        .streamChatClientResponses(conversationId, systemPrompt, effectiveUserText, defaultModel, maxTokens,
+                            ragEnabledForRun,
+                            wikipediaAdvisorEnabledForRun,
+                            toolCallingEnabled,
+                            wikipediaToolEnabledForRun,
+                            knowledgeBaseToolEnabledForRun,
+                            conceptCardToolEnabledForRun,
+                            advisorParams)
+                        .doOnNext(r -> captureRetrievedDocuments(r, ragDocsRef, wikiDocsRef));
+
+                    Flux<ServerSentEvent<String>> deltaFlux = responseFlux
+                        .map(ChatStreamOrchestrator::extractDeltaText)
+                        .filter(s -> s != null && !s.isBlank())
+                        .doOnNext(contentAccumulator::append)
+                        .map(chunk -> toJson(Map.of("text", chunk)))
+                        .map(data -> ServerSentEvent.<String>builder(data).event("delta").build());
+
+                    Flux<ServerSentEvent<String>> doneFlux = Flux.defer(() -> {
+                        int latencyMs = (int) (System.currentTimeMillis() - startMs);
+                        int promptTokensEst = estimateTokens(systemPrompt.length() + effectiveUserText.length() + memoryCharsEst);
+                        int completionTokensEst = estimateTokens(contentAccumulator.length());
+                        double costUsd = estimateCostUsd(promptTokensEst, completionTokensEst);
+                        Map<String, Object> donePayload = new HashMap<>(Map.of(
+                            "status", "done",
+                            "usage", Map.of(
+                                "promptTokens", promptTokensEst,
+                                "completionTokens", completionTokensEst,
+                                "estimatedCostUsd", costUsd
+                            )
+                        ));
+
+                        List<CitationDto> citations = mergeCitations(ragDocsRef.get(), wikiDocsRef.get());
+                        if (citations != null && !citations.isEmpty()) {
+                            List<Map<String, String>> citationMaps = new ArrayList<>();
+                            for (CitationDto c : citations) {
+                                citationMaps.add(Map.of(
+                                    "chunkId", c.getChunkId() != null ? c.getChunkId() : "",
+                                    "source", c.getSource() != null ? c.getSource() : "",
+                                    "excerpt", c.getExcerpt() != null ? c.getExcerpt() : ""
+                                ));
+                            }
+                            donePayload.put("citations", citationMaps);
+                        }
+
+                        String doneData = toJson(donePayload);
+                        finishAssistantMessage(assistantMessageId, contentAccumulator.toString(),
+                            "done", null, null, promptTokensEst, completionTokensEst, costUsd);
+                        usageService.record(assistantMessageId, defaultModel, latencyMs,
+                            promptTokensEst, completionTokensEst, costUsd);
+                        return Flux.just(ServerSentEvent.<String>builder(doneData).event("done").build());
+                    }).subscribeOn(Schedulers.boundedElastic());
+
+                    return deltaFlux
+                        .concatWith(doneFlux)
+                        .onErrorResume(e -> Flux.defer(() -> {
+                            finishAssistantMessage(assistantMessageId, contentAccumulator.toString(),
+                                "error", "provider_error", e.getMessage() != null ? e.getMessage() : "LLM stream failed",
+                                null, null, null);
+                            return Flux.just(serverSentError("provider_error",
+                                e.getMessage() != null ? e.getMessage() : "LLM stream failed", requestId));
+                        }).subscribeOn(Schedulers.boundedElastic()))
+                        .doOnCancel(() -> Schedulers.boundedElastic().schedule(() ->
+                            finishAssistantMessage(assistantMessageId, contentAccumulator.toString(),
+                                "cancelled", null, null, null, null, null)));
+                });
+        }));
+    }
+
+    private enum ManualTool {
+        NONE,
+        WIKI,
+        KB,
+        CARD
+    }
+
+    private static final Pattern KB_TOPK_PATTERN = Pattern.compile("(?i)\\btopk\\s*=\\s*(\\d+)\\b");
+
+    private record ManualDirectiveResult(
+            boolean enabled,
+            ManualTool tool,
+            String cleanedUserText,
+            String augmentedUserText,
+            boolean hasReference,
+            List<Document> ragDocs,
+            List<Document> wikiDocs
+    ) {
+        static ManualDirectiveResult none(String original) {
+            return new ManualDirectiveResult(false, ManualTool.NONE, original, null, false, null, null);
+        }
+    }
+
+    private ManualDirectiveResult resolveManualDirective(String originalUserText, String language) {
+        if (originalUserText == null) {
+            return ManualDirectiveResult.none("");
+        }
+
+        String text = originalUserText.trim();
+        if (text.isEmpty()) {
+            return ManualDirectiveResult.none("");
+        }
+
+        if (startsWithIgnoreCase(text, "@wiki:")) {
+            String q = text.substring("@wiki:".length()).trim();
+            if (q.isEmpty()) {
+                return ManualDirectiveResult.none(originalUserText);
+            }
+            RagRetrieveResult wiki = wikipediaTool.searchWikipedia(q);
+            String ref = wiki != null && wiki.getReferenceText() != null ? wiki.getReferenceText().trim() : "";
+            List<Document> docs = toDocuments(wiki);
+            String augmented = buildAugmentedUserText("参考", ref, q);
+            return new ManualDirectiveResult(true, ManualTool.WIKI, q, augmented,
+                !ref.isBlank() || !docs.isEmpty(), null, docs);
+        }
+
+        if (startsWithIgnoreCase(text, "@kb:")) {
+            String q0 = text.substring("@kb:".length()).trim();
+            if (q0.isEmpty()) {
+                return ManualDirectiveResult.none(originalUserText);
             }
 
-            String doneData = toJson(donePayload);
-            finishAssistantMessage(assistantMessageId, contentAccumulator.toString(),
-                "done", null, null, promptTokensEst, completionTokensEst, costUsd);
-            usageService.record(assistantMessageId, defaultModel, latencyMs,
-                promptTokensEst, completionTokensEst, costUsd);
-            return Flux.just(ServerSentEvent.<String>builder(doneData).event("done").build());
-            }).subscribeOn(Schedulers.boundedElastic());
+            Integer topK = null;
+            Matcher m = KB_TOPK_PATTERN.matcher(q0);
+            if (m.find()) {
+                try {
+                    topK = Integer.parseInt(m.group(1));
+                } catch (Exception ignored) {
+                    topK = null;
+                }
+                q0 = (q0.substring(0, m.start()) + " " + q0.substring(m.end())).trim();
+            }
+            String q = q0;
+            RagRetrieveResult kb = knowledgeBaseTool.searchKnowledgeBase(q, topK);
+            String ref = kb != null && kb.getReferenceText() != null ? kb.getReferenceText().trim() : "";
+            List<Document> docs = toDocuments(kb);
+            String augmented = buildAugmentedUserText("参考", ref, q);
+            return new ManualDirectiveResult(true, ManualTool.KB, q, augmented,
+                !ref.isBlank() || !docs.isEmpty(), docs, null);
+        }
 
-            return deltaFlux
-                .concatWith(doneFlux)
-                .onErrorResume(e -> Flux.defer(() -> {
-                finishAssistantMessage(assistantMessageId, contentAccumulator.toString(),
-                    "error", "provider_error", e.getMessage() != null ? e.getMessage() : "LLM stream failed",
-                    null, null, null);
-                return Flux.just(serverSentError("provider_error",
-                    e.getMessage() != null ? e.getMessage() : "LLM stream failed", requestId));
-                }).subscribeOn(Schedulers.boundedElastic()))
-                .doOnCancel(() -> Schedulers.boundedElastic().schedule(() ->
-                    finishAssistantMessage(assistantMessageId, contentAccumulator.toString(),
-                        "cancelled", null, null, null, null, null)));
-        }));
+        if (startsWithIgnoreCase(text, "@card:")) {
+            String payload = text.substring("@card:".length()).trim();
+            if (payload.isEmpty()) {
+                return ManualDirectiveResult.none(originalUserText);
+            }
+
+            CardArgs args = parseCardArgs(payload, language);
+            Map<String, Object> card = conceptCardTool.lookupConceptCard(args.type, args.lang, args.key, args.text);
+            String json;
+            try {
+                json = objectMapper.writeValueAsString(card);
+            } catch (Exception ignored) {
+                json = String.valueOf(card);
+            }
+
+            String cleaned = args.text != null && !args.text.isBlank() ? args.text : payload;
+            String augmented = buildAugmentedUserText("概念卡", json, cleaned);
+            boolean found = card != null && Boolean.TRUE.equals(card.get("found"));
+            return new ManualDirectiveResult(true, ManualTool.CARD, cleaned, augmented,
+                found || (json != null && !json.isBlank()), null, null);
+        }
+
+        return ManualDirectiveResult.none(originalUserText);
+    }
+
+    private static boolean startsWithIgnoreCase(String text, String prefix) {
+        if (text == null || prefix == null) return false;
+        if (text.length() < prefix.length()) return false;
+        return text.regionMatches(true, 0, prefix, 0, prefix.length());
+    }
+
+    private static String buildAugmentedUserText(String title, String referenceText, String question) {
+        String ref = referenceText != null ? referenceText.trim() : "";
+        String q = question != null ? question : "";
+        if (ref.isBlank()) {
+            return q;
+        }
+        return "[" + title + "]\n\n" + ref + "\n\n---\n\n" + q;
+    }
+
+    private static List<Document> toDocuments(RagRetrieveResult result) {
+        List<Document> docs = new ArrayList<>();
+        if (result == null || result.getCitations() == null) {
+            return docs;
+        }
+        for (CitationDto c : result.getCitations()) {
+            if (c == null) continue;
+            String t = c.getExcerpt() != null ? c.getExcerpt() : "";
+            if (t.isBlank()) continue;
+            Map<String, Object> meta = new HashMap<>();
+            if (c.getSource() != null) meta.put("source", c.getSource());
+            if (c.getChunkId() != null) meta.put("chunk_id", c.getChunkId());
+            docs.add(new Document(t, meta));
+        }
+        return docs;
+    }
+
+    private record CardArgs(String type, String lang, String key, String text) {}
+
+    private static CardArgs parseCardArgs(String payload, String defaultLang) {
+        String type = "term";
+        String lang = (defaultLang == null || defaultLang.isBlank()) ? "en" : defaultLang.trim().toLowerCase();
+        String key = null;
+        String text = payload;
+
+        String lower = payload.toLowerCase();
+        if (lower.contains("type=") || lower.contains("lang=") || lower.contains("key=") || lower.contains("text=")) {
+            type = extractKv(payload, "type", type);
+            lang = extractKv(payload, "lang", lang);
+            key = extractKvNullable(payload, "key");
+            String extractedText = extractTextKv(payload);
+            if (extractedText != null && !extractedText.isBlank()) {
+                text = extractedText;
+            }
+        } else {
+            // shorthand: "term zh 黑洞" / "zh 黑洞" / "黑洞"
+            String[] parts = payload.trim().split("\\s+", 3);
+            if (parts.length >= 1) {
+                if ("term".equalsIgnoreCase(parts[0]) || "sym".equalsIgnoreCase(parts[0])) {
+                    type = parts[0].toLowerCase();
+                    if (parts.length >= 2 && ("zh".equalsIgnoreCase(parts[1]) || "en".equalsIgnoreCase(parts[1]))) {
+                        lang = parts[1].toLowerCase();
+                        if (parts.length == 3) {
+                            text = parts[2];
+                        }
+                    } else if (parts.length >= 2) {
+                        text = payload.substring(parts[0].length()).trim();
+                    }
+                } else if ("zh".equalsIgnoreCase(parts[0]) || "en".equalsIgnoreCase(parts[0])) {
+                    lang = parts[0].toLowerCase();
+                    if (parts.length >= 2) {
+                        text = payload.substring(parts[0].length()).trim();
+                    }
+                }
+            }
+        }
+
+        if (!"term".equalsIgnoreCase(type) && !"sym".equalsIgnoreCase(type)) {
+            type = "term";
+        }
+        if (!"zh".equalsIgnoreCase(lang) && !"en".equalsIgnoreCase(lang)) {
+            lang = "en";
+        }
+        if (text != null) {
+            text = stripQuotes(text.trim());
+        }
+        if (key != null) {
+            key = stripQuotes(key.trim());
+            if (key.isBlank()) key = null;
+        }
+        return new CardArgs(type, lang, key, text);
+    }
+
+    private static String extractKv(String payload, String key, String defaultValue) {
+        String v = extractKvNullable(payload, key);
+        if (v == null || v.isBlank()) {
+            return defaultValue;
+        }
+        return stripQuotes(v.trim());
+    }
+
+    private static String extractKvNullable(String payload, String key) {
+        String lower = payload.toLowerCase();
+        int idx = lower.indexOf(key.toLowerCase() + "=");
+        if (idx < 0) return null;
+        int start = idx + key.length() + 1;
+
+        // read until whitespace
+        int end = payload.length();
+        for (int i = start; i < payload.length(); i++) {
+            char ch = payload.charAt(i);
+            if (Character.isWhitespace(ch)) {
+                end = i;
+                break;
+            }
+        }
+        return payload.substring(start, end);
+    }
+
+    private static String extractTextKv(String payload) {
+        String lower = payload.toLowerCase();
+        int idx = lower.indexOf("text=");
+        if (idx < 0) return null;
+        String v = payload.substring(idx + "text=".length()).trim();
+        return stripQuotes(v);
+    }
+
+    private static String stripQuotes(String s) {
+        if (s == null) return null;
+        String t = s.trim();
+        if (t.length() >= 2 && ((t.startsWith("\"") && t.endsWith("\"")) || (t.startsWith("'") && t.endsWith("'")))) {
+            return t.substring(1, t.length() - 1);
+        }
+        return t;
     }
 
     private void primeChatMemoryFromDb(String conversationId, Message currentUserMessage) {

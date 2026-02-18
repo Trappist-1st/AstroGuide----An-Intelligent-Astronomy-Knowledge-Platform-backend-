@@ -38,5 +38,8 @@ public interface ChatStreamService {
             boolean ragEnabled,
             boolean wikipediaOnDemandEnabled,
             boolean toolCallingEnabled,
+            boolean wikipediaToolEnabled,
+            boolean knowledgeBaseToolEnabled,
+            boolean conceptCardToolEnabled,
             Map<String, Object> advisorParams);
 }

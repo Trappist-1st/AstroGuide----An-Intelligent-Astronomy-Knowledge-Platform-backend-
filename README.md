@@ -79,6 +79,31 @@ Key configuration options in `application.yaml`:
 - `app.rag.enabled`: Enable/disable RAG advisor
 - `app.rag.wikipedia-on-demand.enabled`: Enable Wikipedia advisor when tools are disabled
 
+## Manual Tool Invocation (User-Driven)
+
+In addition to automatic tool calling (model decides based on natural language), AstroGuide supports **explicit, deterministic tool invocations** via simple prefixes in the chat message.
+
+When a message starts with a directive, the backend will:
+- Prefetch the requested tool result (Wikipedia / KB / Concept Card)
+- Inject the retrieved content into the prompt as reference
+- Keep automatic tool calling enabled (if configured), so the model can still call other tools in the same run
+- Disable only the explicitly requested tool for that run (to avoid duplicate calls)
+
+Supported directives:
+
+- `@wiki: <query>`
+  - Example: `@wiki: black hole`
+
+- `@kb: <query> [topk=<n>]`
+  - Example: `@kb: Chandrasekhar limit topk=5`
+
+- `@card: <payload>`
+  - Shorthand examples:
+    - `@card: 黑洞`
+    - `@card: term zh 黑洞`
+  - Key-value examples:
+    - `@card: type=term lang=zh text="黑洞"`
+
 ## Project Structure
 
 ```
