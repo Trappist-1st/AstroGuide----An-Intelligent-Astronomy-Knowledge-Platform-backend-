@@ -7,7 +7,7 @@ spring:
     name: AstroGuide
   # 数据源（环境变量见 .env.example）
   datasource:
-    url: jdbc:mysql://${DB_HOST:localhost}:${DB_PORT:3306}/${DB_NAME:astroguide}?useUnicode=true&characterEncoding=utf-8&useSSL=false&serverTimezone=Asia/Shanghai
+    url: jdbc:mysql://${DB_HOST:localhost}:${DB_PORT:3306}/${DB_NAME:astroguide}?useUnicode=true&characterEncoding=utf-8&useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=Asia/Shanghai
     username: ${DB_USERNAME:root}
     password: ${DB_PASSWORD:}
 
@@ -15,6 +15,7 @@ spring:
   ai:
     openai:
       api-key: ${OPENAI_API_KEY}
+      # 注意：base-url 不要带 /v1；Spring AI 会自动拼接 /v1
       base-url: ${OPENAI_BASE_URL:https://api.deepseek.com}
       chat:
         options:
@@ -22,20 +23,26 @@ spring:
           temperature: 0.7
           max-tokens: 2000
       # Embedding 用于 RAG 向量检索；可单独指定 base-url/model/key，对接硅基流动等 OpenAI 兼容接口
-      # 硅基流动：base-url=https://api.siliconflow.cn/v1，model 如 BAAI/bge-large-zh-v1.5（1024 维）或 Qwen/Qwen3-Embedding-0.6B
+      # 硅基流动：base-url=https://api.siliconflow.cn（不要带 /v1），model 如 BAAI/bge-large-zh-v1.5（1024 维）或 Qwen/Qwen3-Embedding-0.6B
       embedding:
         api-key: ${OPENAI_EMBEDDING_API_KEY:${OPENAI_API_KEY}}
-        base-url: ${OPENAI_EMBEDDING_BASE_URL:https://api.siliconflow.cn/v1}
+        # 注意：base-url 不要带 /v1；Spring AI 会自动拼接 /v1
+        base-url: ${OPENAI_EMBEDDING_BASE_URL:https://api.siliconflow.cn}
         options:
+          # 维度须与 Qdrant 集合一致：Qwen3-Embedding-4B=2560；若集合为 1536 维可改为 1536 维模型
           model: ${OPENAI_EMBEDDING_MODEL:Qwen/Qwen3-Embedding-4B}
     # Qdrant 向量库（V1 RAG）；Docker 部署时 host/port 指向 Qdrant 服务（gRPC 端口 6334）
+    # 重要：集合的向量维度必须与 Embedding 模型一致。Qwen3-Embedding-4B=2560，OpenAI ada-002=1536。
+    # 若报错 expected dim: 1536, got 2560，请删除旧集合后重启（或改用 1536 维的 embedding 模型）。
     vectorstore:
       qdrant:
         host: ${QDRANT_HOST:36.138.238.148}
         port: ${QDRANT_PORT:6334}
         collection-name: ${QDRANT_COLLECTION:astro_knowledge}
-        # 启动时若 collection 不存在则自动创建（需配合 EmbeddingModel 维度）
+        # 启动时若 collection 不存在则自动创建（维度由当前 EmbeddingModel 决定）
         initialize-schema: ${QDRANT_INITIALIZE_SCHEMA:true}
+        # 客户端(1.16.0) 与服务端(1.16.x) 版本已对齐；此开关可防止未来小版本漂移时再报 WARN
+        check-compatibility: false
 
 # Concept Card：未命中时是否调用 LLM 生成并缓存（默认 false，仅查缓存）
 app:
@@ -49,7 +56,3 @@ app:
   rag:
     enabled: ${RAG_ENABLED:false}
     top-k: ${RAG_TOP_K:8}
-    wikipedia-on-demand:
-      enabled: ${RAG_WIKIPEDIA_ENABLED:false}
-      max-results: ${RAG_WIKIPEDIA_MAX_RESULTS:4}
-      max-chars-per-result: ${RAG_WIKIPEDIA_MAX_CHARS:1000}

@@ -6,6 +6,9 @@ import com.imperium.astroguide.model.entity.Conversation;
 import com.imperium.astroguide.model.entity.Message;
 import com.imperium.astroguide.service.ConversationService;
 import com.imperium.astroguide.service.MessageService;
+import io.swagger.v3.oas.annotations.Operation;
+import io.swagger.v3.oas.annotations.Parameter;
+import io.swagger.v3.oas.annotations.tags.Tag;
 import jakarta.validation.Valid;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
@@ -22,6 +25,7 @@ import java.util.UUID;
  */
 @RestController
 @RequestMapping("/api/v0/conversations")
+@Tag(name = "Messages", description = "消息提交接口")
 public class MessageController {
 
     private static final String HEADER_CLIENT_ID = "X-Client-Id";
@@ -41,8 +45,11 @@ public class MessageController {
      * 客户端随后 GET streamUrl 获取流式输出。
      */
     @PostMapping("/{conversationId}/messages")
+        @Operation(summary = "提交消息", description = "提交用户消息并创建 assistant queued 占位消息")
     public ResponseEntity<?> submitMessage(
+            @Parameter(description = "会话 ID", required = true)
             @PathVariable String conversationId,
+            @Parameter(description = "客户端标识", required = true)
             @RequestHeader(value = HEADER_CLIENT_ID, required = false) String clientId,
             @Valid @RequestBody SubmitMessageRequest body) {
 
@@ -60,17 +67,17 @@ public class MessageController {
             return error(HttpStatus.FORBIDDEN, "forbidden", "clientId does not match conversation", null, null);
         }
 
-        // 幂等：同一会话下相同 clientMessageId 返回同一 messageId
+        // 幂等：同一会话下相同 clientMessageId 且相同 content 才返回同一 messageId（仅对重试生效；新消息必生成新 ID）
         String clientMessageId = body.getClientMessageId();
         if (clientMessageId != null && !clientMessageId.isBlank()) {
             Message existing = messageService.lambdaQuery()
                     .eq(Message::getConversationId, conversationId)
                     .eq(Message::getClientMessageId, clientMessageId)
-                .eq(Message::getRole, "user")
+                    .eq(Message::getRole, "user")
                     .last("LIMIT 1")
                     .one();
-            if (existing != null) {
-            ensureAssistantPlaceholder(conversationId, existing.getId(), existing.getDifficulty(), existing.getLanguage());
+            if (existing != null && Objects.equals(existing.getContent(), content)) {
+                ensureAssistantPlaceholder(conversationId, existing.getId(), existing.getDifficulty(), existing.getLanguage());
                 String streamUrl = String.format(STREAM_PATH_TEMPLATE, conversationId, existing.getId());
                 return ResponseEntity.status(HttpStatus.ACCEPTED)
                         .body(SubmitMessageResponse.builder()

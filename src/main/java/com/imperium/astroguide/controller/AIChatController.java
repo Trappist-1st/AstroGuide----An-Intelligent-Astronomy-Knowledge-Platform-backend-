@@ -1,6 +1,9 @@
 package com.imperium.astroguide.controller;
 
 import com.imperium.astroguide.ai.orchestrator.ChatStreamOrchestrator;
+import io.swagger.v3.oas.annotations.Operation;
+import io.swagger.v3.oas.annotations.Parameter;
+import io.swagger.v3.oas.annotations.tags.Tag;
 import jakarta.servlet.http.HttpServletRequest;
 import org.springframework.http.MediaType;
 import org.springframework.http.codec.ServerSentEvent;
@@ -17,6 +20,7 @@ import reactor.core.publisher.Flux;
  */
 @RestController
 @RequestMapping("/api/v0/conversations")
+@Tag(name = "AI Chat", description = "AI 流式问答接口")
 public class AIChatController {
 
     private static final String HEADER_CLIENT_ID = "X-Client-Id";
@@ -35,9 +39,13 @@ public class AIChatController {
      */
     @GetMapping(value = "/{conversationId}/messages/{messageId}/stream",
                 produces = MediaType.TEXT_EVENT_STREAM_VALUE)
+    @Operation(summary = "流式获取回答", description = "返回 SSE 事件流：meta/delta/done/error")
     public Flux<ServerSentEvent<String>> stream(
+            @Parameter(description = "会话 ID", required = true)
             @PathVariable String conversationId,
+            @Parameter(description = "用户消息 ID", required = true)
             @PathVariable String messageId,
+            @Parameter(description = "客户端标识", required = true)
             @RequestHeader(value = HEADER_CLIENT_ID, required = false) String clientId,
             HttpServletRequest request) {
         return chatStreamOrchestrator.stream(conversationId, messageId, clientId, request);

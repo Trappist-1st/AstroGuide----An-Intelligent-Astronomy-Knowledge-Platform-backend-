@@ -24,6 +24,6 @@ public class SubmitMessageRequest {
     @Pattern(regexp = "^(en|zh)?$", message = "language must be one of: en, zh")
     private String language;
 
-    /** 可选，前端幂等键，同一会话下相同 clientMessageId 返回同一 messageId */
+    /** 可选，前端幂等键：同一会话下相同 clientMessageId 且相同 content 时返回同一 messageId（用于重试）；不同 content 会生成新消息 */
     private String clientMessageId;
 }

@@ -6,6 +6,9 @@ import com.imperium.astroguide.model.entity.Conversation;
 import com.imperium.astroguide.model.entity.Message;
 import com.imperium.astroguide.service.ConversationService;
 import com.imperium.astroguide.service.MessageService;
+import io.swagger.v3.oas.annotations.Operation;
+import io.swagger.v3.oas.annotations.Parameter;
+import io.swagger.v3.oas.annotations.tags.Tag;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
@@ -19,6 +22,7 @@ import java.util.stream.Collectors;
  */
 @RestController
 @RequestMapping("/api/v0/conversations")
+@Tag(name = "Conversations", description = "会话管理接口")
 public class ConversationController {
 
     private static final String HEADER_CLIENT_ID = "X-Client-Id";
@@ -38,7 +42,9 @@ public class ConversationController {
      * 创建会话。TDD: POST /conversations
      */
     @PostMapping
+        @Operation(summary = "创建会话", description = "创建一个新的会话，必须携带 X-Client-Id")
     public ResponseEntity<?> create(
+            @Parameter(description = "客户端标识", required = true)
             @RequestHeader(value = HEADER_CLIENT_ID, required = false) String clientId,
             @RequestBody(required = false) CreateConversationRequest body) {
 
@@ -72,9 +78,13 @@ public class ConversationController {
      * Query: limit（默认 20，最大 50）, cursor（可选游标）
      */
     @GetMapping
+        @Operation(summary = "会话列表", description = "按更新时间倒序获取当前客户端会话列表")
     public ResponseEntity<?> list(
+            @Parameter(description = "客户端标识", required = true)
             @RequestHeader(value = HEADER_CLIENT_ID, required = false) String clientId,
+            @Parameter(description = "分页大小，默认 20，最大 50")
             @RequestParam(defaultValue = "20") int limit,
+            @Parameter(description = "分页游标，传入上次返回列表末尾会话 ID")
             @RequestParam(required = false) String cursor) {
 
         if (clientId == null || clientId.isBlank()) {
@@ -145,10 +155,15 @@ public class ConversationController {
      * Query: limit（默认 50，最大 200）, before（可选，消息 id 向前翻页）
      */
     @GetMapping("/{conversationId}")
+        @Operation(summary = "会话详情", description = "获取会话详情及最近消息，支持 before 向前翻页")
     public ResponseEntity<?> getDetail(
+            @Parameter(description = "会话 ID", required = true)
             @PathVariable String conversationId,
+            @Parameter(description = "客户端标识", required = true)
             @RequestHeader(value = HEADER_CLIENT_ID, required = false) String clientId,
+            @Parameter(description = "返回消息数量，默认 50，最大 200")
             @RequestParam(defaultValue = "50") int limit,
+            @Parameter(description = "向前翻页锚点消息 ID")
             @RequestParam(required = false) String before) {
 
         if (clientId == null || clientId.isBlank()) {

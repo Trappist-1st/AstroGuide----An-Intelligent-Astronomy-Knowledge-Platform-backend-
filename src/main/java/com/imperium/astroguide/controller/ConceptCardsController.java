@@ -2,6 +2,9 @@ package com.imperium.astroguide.controller;
 
 import com.imperium.astroguide.model.dto.response.ConceptCardResponse;
 import com.imperium.astroguide.service.ConceptCardService;
+import io.swagger.v3.oas.annotations.Operation;
+import io.swagger.v3.oas.annotations.Parameter;
+import io.swagger.v3.oas.annotations.tags.Tag;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.GetMapping;
@@ -20,6 +23,7 @@ import java.util.UUID;
  */
 @RestController
 @RequestMapping("/api/v0/concepts")
+@Tag(name = "Concept Cards", description = "概念卡片查询接口")
 public class ConceptCardsController {
 
     private static final String HEADER_CLIENT_ID = "X-Client-Id";
@@ -36,11 +40,17 @@ public class ConceptCardsController {
      * Query: type（必填 term|sym）, lang（必填 en|zh）, key（可选）, text（可选）
      */
     @GetMapping("/lookup")
+        @Operation(summary = "查询概念卡", description = "按 type/lang/key(text) 查询概念卡片")
     public ResponseEntity<?> lookup(
+            @Parameter(description = "客户端标识", required = true)
             @RequestHeader(value = HEADER_CLIENT_ID, required = false) String clientId,
+            @Parameter(description = "类型：term 或 sym", required = true)
             @RequestParam String type,
+            @Parameter(description = "语言：en 或 zh", required = true)
             @RequestParam String lang,
+            @Parameter(description = "概念 key")
             @RequestParam(required = false) String key,
+            @Parameter(description = "待解释文本")
             @RequestParam(required = false) String text) {
 
         if (clientId == null || clientId.isBlank()) {
