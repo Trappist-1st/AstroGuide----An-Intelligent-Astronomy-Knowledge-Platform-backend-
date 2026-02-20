@@ -5,7 +5,7 @@
 ## 0. 基本约定
 
 ### 0.1 Base URL
-
+- http://localhost:8093/swagger-ui/index.html 这是接口文档的地址
 - 本地（示例）：`http://localhost:8080`
 - 统一前缀：`/api/v0`
 
@@ -226,6 +226,8 @@ ApiFox 测试步骤：
 - Header: `X-Client-Id` 必填
 - Body（JSON，`content` 必填 1~4000）：
 
+**示例 1（中文）：**
+
 ```json
 {
   "content": "请解释什么是洛希极限，并给一个直观例子",
@@ -234,6 +236,22 @@ ApiFox 测试步骤：
   "clientMessageId": "m_0001"
 }
 ```
+
+**示例 2（英文，适合测试 RAG + Wikipedia 工具）：**
+
+```json
+{
+  "content": "Tell me about the theory of inflation and cosmic strings",
+  "difficulty": "advanced",
+  "language": "en",
+  "clientMessageId": "test_inflation_cosmic_001"
+}
+```
+
+- `content`：必填，1~4000 字符。
+- `difficulty`：可选，`basic` | `intermediate` | `advanced`，不传时默认 intermediate。
+- `language`：可选，`en` | `zh`，不传时默认 en。
+- `clientMessageId`：可选，用于幂等；同一会话下相同 clientMessageId 且相同 content 时返回同一 messageId。测试时可用唯一字符串（如 `test_inflation_cosmic_001`）或省略。
 
 Success: `202 Accepted`
 
@@ -264,6 +282,14 @@ ApiFox 测试步骤（推荐做成一个集合场景）：
 - `content` 为空 → `400 invalid_argument`（来自 @Valid）
 - 会话不存在 → `404 not_found`
 - clientId 不匹配 → `403 forbidden`
+
+#### 如何测试 Wikipedia / 工具调用
+
+- **不需要在用户问题里显式写“查维基”**：智能体注册了 `search_wikipedia` 工具（描述为“Search Wikipedia for public astronomy background…”），模型会根据工具描述在合适时自动决定是否调用。
+- **系统提示中已包含**：对事实性、百科类问题可酌情使用 `search_wikipedia`，因此用户只需问“Tell me about cosmic strings”或“请讲一讲暴涨理论和宇宙弦”等，即有可能触发工具调用。
+- **提高触发概率的写法（可选）**：若希望更容易观察到工具调用，可在 `content` 中写“Search Wikipedia for [topic] and summarize”或“请查一下维基上关于……并总结”。
+- **推荐测试 Body**：用上面的**示例 2** 作为请求体，提交后打开返回的 `streamUrl` 用 SSE 接收流；在服务端日志或后续的 `done` 事件中若有 citations，且来源为 Wikipedia，则说明调用了 Wikipedia 工具。
+- **前置条件**：`app.ai.tools.enabled=true`（默认 true）；Wikipedia 接口需可用（配置正确且网络可达）。
 
 ---
 

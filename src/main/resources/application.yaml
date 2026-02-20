@@ -5,6 +5,11 @@ server:
 spring:
   application:
     name: AstroGuide
+  # 上传文件大小限制（Ingest 上传 PDF/EPUB 等，默认 100MB）
+  servlet:
+    multipart:
+      max-file-size: ${MULTIPART_MAX_FILE_SIZE:100MB}
+      max-request-size: ${MULTIPART_MAX_REQUEST_SIZE:100MB}
   # 数据源（环境变量见 .env.example）
   datasource:
     url: jdbc:mysql://${DB_HOST:localhost}:${DB_PORT:3306}/${DB_NAME:astroguide}?useUnicode=true&characterEncoding=utf-8&useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=Asia/Shanghai
@@ -56,3 +61,7 @@ app:
   rag:
     enabled: ${RAG_ENABLED:false}
     top-k: ${RAG_TOP_K:8}
+  # 资料摄入（Ingest）：分块参数，仅当 RAG 开启时写入向量库生效
+  ingest:
+    chunk-size: ${INGEST_CHUNK_SIZE:600}
+    chunk-overlap: ${INGEST_CHUNK_OVERLAP:80}

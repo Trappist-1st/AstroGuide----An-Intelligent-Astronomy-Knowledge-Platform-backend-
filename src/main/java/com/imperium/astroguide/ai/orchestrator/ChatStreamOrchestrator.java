@@ -350,8 +350,8 @@ public class ChatStreamOrchestrator {
                 + " Structure your answer: conclusion first, then layered explanation, optional formulas, "
                 + "common misconceptions, and next-step suggestions. "
                 + "Use Markdown and LaTeX where appropriate. Do not fabricate citations."
-                + " If reference materials are provided in the context, prioritize them and cite sources."
-                + " When no reference context is provided or the context is empty, answer directly from your general astronomical knowledge; do not refuse, do not ask the user to supply context, and do not say the context appears empty."
+                + " When helpful for factual or encyclopedic topics (e.g. definitions, historical or current public knowledge), use the search_wikipedia tool to fetch and cite information; you do not need the user to explicitly ask for Wikipedia."
+                + " Answering boundary (RAG-first with general-knowledge supplement): (1) If reference materials are provided in the context, prioritize them and cite sources for the parts they cover. (2) If the user asks about multiple topics and only some are covered in the context, answer from context for those; for topics NOT in the context, do not refuse—briefly explain from your general knowledge and clearly label the boundary (e.g. in Chinese: \"资料中未提及，但一般意义上……\"; in English: \"The provided materials do not cover this; in general, …\"), then suggest consulting more resources. (3) When no reference context is provided or the context is empty, answer directly from your general astronomical knowledge; do not refuse or say the context is empty."
                 + markerProtocol;
     }
 
