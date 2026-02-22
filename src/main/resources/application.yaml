@@ -51,8 +51,11 @@ spring:
 
 # Concept Card：未命中时是否调用 LLM 生成并缓存（默认 false，仅查缓存）
 app:
+  # 跨域：允许的前端来源，多个用逗号分隔（默认 Vite dev 端口）
+  cors:
+    allowed-origins: ${CORS_ALLOWED_ORIGINS:http://localhost:5173}
   concept-card:
-    generate-on-miss: false
+    generate-on-miss: true
   # 工具调用：仅使用 Spring AI @Tool + .tools()，由 ChatModel 托管 tool 执行与多轮回填（无自研 agent 循环）
   ai:
     tools:
@@ -65,3 +68,15 @@ app:
   ingest:
     chunk-size: ${INGEST_CHUNK_SIZE:600}
     chunk-overlap: ${INGEST_CHUNK_OVERLAP:80}
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics
+  endpoint:
+    health:
+      show-details: never
+  metrics:
+    tags:
+      application: ${spring.application.name}

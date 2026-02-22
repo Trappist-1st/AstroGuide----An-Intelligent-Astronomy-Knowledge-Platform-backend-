@@ -1,10 +1,12 @@
 package com.imperium.astroguide.controller;
 
+import com.imperium.astroguide.config.RequestIdSupport;
 import com.imperium.astroguide.model.dto.response.ConceptCardResponse;
 import com.imperium.astroguide.service.ConceptCardService;
 import io.swagger.v3.oas.annotations.Operation;
 import io.swagger.v3.oas.annotations.Parameter;
 import io.swagger.v3.oas.annotations.tags.Tag;
+import jakarta.servlet.http.HttpServletRequest;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.GetMapping;
@@ -15,7 +17,6 @@ import org.springframework.web.bind.annotation.RestController;
 
 import java.util.HashMap;
 import java.util.Map;
-import java.util.UUID;
 
 /**
  * Concept Cards 点读解释，对应 TDD 5.4。
@@ -44,6 +45,7 @@ public class ConceptCardsController {
     public ResponseEntity<?> lookup(
             @Parameter(description = "客户端标识", required = true)
             @RequestHeader(value = HEADER_CLIENT_ID, required = false) String clientId,
+            HttpServletRequest request,
             @Parameter(description = "类型：term 或 sym", required = true)
             @RequestParam String type,
             @Parameter(description = "语言：en 或 zh", required = true)
@@ -54,22 +56,23 @@ public class ConceptCardsController {
             @RequestParam(required = false) String text) {
 
         if (clientId == null || clientId.isBlank()) {
-            return error(HttpStatus.BAD_REQUEST, "invalid_argument", "X-Client-Id is required", "header", HEADER_CLIENT_ID);
+            return error(HttpStatus.BAD_REQUEST, "invalid_argument", "X-Client-Id is required", "header", HEADER_CLIENT_ID,
+                    request);
         }
         if (type == null || type.isBlank()) {
-            return error(HttpStatus.BAD_REQUEST, "invalid_argument", "type is required", "field", "type");
+            return error(HttpStatus.BAD_REQUEST, "invalid_argument", "type is required", "field", "type", request);
         }
         if (!type.equalsIgnoreCase("term") && !type.equalsIgnoreCase("sym")) {
-            return error(HttpStatus.BAD_REQUEST, "invalid_argument", "type must be term or sym", "field", "type");
+            return error(HttpStatus.BAD_REQUEST, "invalid_argument", "type must be term or sym", "field", "type", request);
         }
         if (lang == null || lang.isBlank()) {
-            return error(HttpStatus.BAD_REQUEST, "invalid_argument", "lang is required", "field", "lang");
+            return error(HttpStatus.BAD_REQUEST, "invalid_argument", "lang is required", "field", "lang", request);
         }
         if (!lang.equalsIgnoreCase("en") && !lang.equalsIgnoreCase("zh")) {
-            return error(HttpStatus.BAD_REQUEST, "invalid_argument", "lang must be en or zh", "field", "lang");
+            return error(HttpStatus.BAD_REQUEST, "invalid_argument", "lang must be en or zh", "field", "lang", request);
         }
         if ((key == null || key.isBlank()) && (text == null || text.isBlank())) {
-            return error(HttpStatus.BAD_REQUEST, "invalid_argument", "key or text is required", "field", "key");
+            return error(HttpStatus.BAD_REQUEST, "invalid_argument", "key or text is required", "field", "key", request);
         }
 
         ConceptCardResponse card = conceptCardService.lookup(
@@ -79,17 +82,19 @@ public class ConceptCardsController {
                 text != null ? text.trim() : null);
 
         if (card == null) {
-            return error(HttpStatus.NOT_FOUND, "not_found", "Concept card not found and generation disabled or failed", null, null);
+            return error(HttpStatus.NOT_FOUND, "not_found", "Concept card not found and generation disabled or failed", null,
+                    null, request);
         }
         return ResponseEntity.ok(card);
     }
 
     private static ResponseEntity<Map<String, Object>> error(
-            HttpStatus status, String code, String message, String detailsKey, Object detailsValue) {
+            HttpStatus status, String code, String message, String detailsKey, Object detailsValue,
+            HttpServletRequest request) {
         Map<String, Object> err = new HashMap<>();
         err.put("code", code);
         err.put("message", message);
-        err.put("requestId", "req_" + UUID.randomUUID().toString().replace("-", "").substring(0, 16));
+        err.put("requestId", RequestIdSupport.resolve(request));
         if (detailsKey != null && detailsValue != null) {
             err.put("details", Map.of(detailsKey, detailsValue));
         }

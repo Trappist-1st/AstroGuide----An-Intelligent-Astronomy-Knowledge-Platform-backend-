@@ -1,5 +1,6 @@
 package com.imperium.astroguide.controller;
 
+import com.imperium.astroguide.config.RequestIdSupport;
 import com.imperium.astroguide.model.dto.request.CreateConversationRequest;
 import com.imperium.astroguide.model.dto.response.*;
 import com.imperium.astroguide.model.entity.Conversation;
@@ -13,6 +14,7 @@ import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
 
+import jakarta.servlet.http.HttpServletRequest;
 import java.time.LocalDateTime;
 import java.util.*;
 import java.util.stream.Collectors;
@@ -46,10 +48,12 @@ public class ConversationController {
     public ResponseEntity<?> create(
             @Parameter(description = "客户端标识", required = true)
             @RequestHeader(value = HEADER_CLIENT_ID, required = false) String clientId,
+            HttpServletRequest request,
             @RequestBody(required = false) CreateConversationRequest body) {
 
         if (clientId == null || clientId.isBlank()) {
-            return error(HttpStatus.BAD_REQUEST, "invalid_argument", "X-Client-Id is required", "header", HEADER_CLIENT_ID);
+            return error(HttpStatus.BAD_REQUEST, "invalid_argument", "X-Client-Id is required", "header", HEADER_CLIENT_ID,
+                    request);
         }
 
         String title = (body != null && body.getTitle() != null) ? body.getTitle() : null;
@@ -82,13 +86,15 @@ public class ConversationController {
     public ResponseEntity<?> list(
             @Parameter(description = "客户端标识", required = true)
             @RequestHeader(value = HEADER_CLIENT_ID, required = false) String clientId,
+            HttpServletRequest request,
             @Parameter(description = "分页大小，默认 20，最大 50")
             @RequestParam(defaultValue = "20") int limit,
             @Parameter(description = "分页游标，传入上次返回列表末尾会话 ID")
             @RequestParam(required = false) String cursor) {
 
         if (clientId == null || clientId.isBlank()) {
-            return error(HttpStatus.BAD_REQUEST, "invalid_argument", "X-Client-Id is required", "header", HEADER_CLIENT_ID);
+            return error(HttpStatus.BAD_REQUEST, "invalid_argument", "X-Client-Id is required", "header", HEADER_CLIENT_ID,
+                    request);
         }
 
         int size = Math.min(Math.max(1, limit), LIST_LIMIT_MAX);
@@ -99,7 +105,7 @@ public class ConversationController {
         if (cursor != null && !cursor.isBlank()) {
             Conversation cursorConv = conversationService.getById(cursor);
             if (cursorConv == null || !cursorConv.getClientId().equals(clientId)) {
-                return error(HttpStatus.BAD_REQUEST, "invalid_argument", "Invalid cursor", "cursor", cursor);
+                return error(HttpStatus.BAD_REQUEST, "invalid_argument", "Invalid cursor", "cursor", cursor, request);
             }
             list = conversationService.lambdaQuery()
                     .eq(Conversation::getClientId, clientId)
@@ -161,21 +167,23 @@ public class ConversationController {
             @PathVariable String conversationId,
             @Parameter(description = "客户端标识", required = true)
             @RequestHeader(value = HEADER_CLIENT_ID, required = false) String clientId,
+            HttpServletRequest request,
             @Parameter(description = "返回消息数量，默认 50，最大 200")
             @RequestParam(defaultValue = "50") int limit,
             @Parameter(description = "向前翻页锚点消息 ID")
             @RequestParam(required = false) String before) {
 
         if (clientId == null || clientId.isBlank()) {
-            return error(HttpStatus.BAD_REQUEST, "invalid_argument", "X-Client-Id is required", "header", HEADER_CLIENT_ID);
+            return error(HttpStatus.BAD_REQUEST, "invalid_argument", "X-Client-Id is required", "header", HEADER_CLIENT_ID,
+                    request);
         }
 
         Conversation conversation = conversationService.getById(conversationId);
         if (conversation == null) {
-            return error(HttpStatus.NOT_FOUND, "not_found", "Conversation not found", null, null);
+            return error(HttpStatus.NOT_FOUND, "not_found", "Conversation not found", null, null, request);
         }
         if (!conversation.getClientId().equals(clientId)) {
-            return error(HttpStatus.FORBIDDEN, "forbidden", "clientId does not match conversation", null, null);
+            return error(HttpStatus.FORBIDDEN, "forbidden", "clientId does not match conversation", null, null, request);
         }
 
         int size = Math.min(Math.max(1, limit), DETAIL_LIMIT_MAX);
@@ -186,7 +194,7 @@ public class ConversationController {
         if (before != null && !before.isBlank()) {
             Message beforeMsg = messageService.getById(before);
             if (beforeMsg == null || !beforeMsg.getConversationId().equals(conversationId)) {
-                return error(HttpStatus.BAD_REQUEST, "invalid_argument", "Invalid before", "before", before);
+                return error(HttpStatus.BAD_REQUEST, "invalid_argument", "Invalid before", "before", before, request);
             }
             messages = messageService.lambdaQuery()
                     .eq(Message::getConversationId, conversationId)
@@ -237,11 +245,12 @@ public class ConversationController {
     }
 
     private static ResponseEntity<Map<String, Object>> error(
-            HttpStatus status, String code, String message, String detailsKey, Object detailsValue) {
+            HttpStatus status, String code, String message, String detailsKey, Object detailsValue,
+            HttpServletRequest request) {
         Map<String, Object> err = new HashMap<>();
         err.put("code", code);
         err.put("message", message);
-        err.put("requestId", "req_" + UUID.randomUUID().toString().replace("-", "").substring(0, 16));
+        err.put("requestId", RequestIdSupport.resolve(request));
         if (detailsKey != null && detailsValue != null) {
             err.put("details", Map.of(detailsKey, detailsValue));
         }

@@ -1,6 +1,7 @@
 package com.imperium.astroguide.controller;
 
 import com.imperium.astroguide.ai.orchestrator.ChatStreamOrchestrator;
+import com.imperium.astroguide.config.RequestIdSupport;
 import io.swagger.v3.oas.annotations.Operation;
 import io.swagger.v3.oas.annotations.Parameter;
 import io.swagger.v3.oas.annotations.tags.Tag;
@@ -48,6 +49,7 @@ public class AIChatController {
             @Parameter(description = "客户端标识", required = true)
             @RequestHeader(value = HEADER_CLIENT_ID, required = false) String clientId,
             HttpServletRequest request) {
-        return chatStreamOrchestrator.stream(conversationId, messageId, clientId, request);
+        String requestId = RequestIdSupport.resolve(request);
+        return chatStreamOrchestrator.stream(conversationId, messageId, clientId, requestId, request);
     }
 }

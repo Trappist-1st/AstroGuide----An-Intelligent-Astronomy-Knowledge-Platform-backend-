@@ -1,5 +1,6 @@
 package com.imperium.astroguide.controller;
 
+import com.imperium.astroguide.config.RequestIdSupport;
 import com.imperium.astroguide.model.dto.request.SubmitMessageRequest;
 import com.imperium.astroguide.model.dto.response.SubmitMessageResponse;
 import com.imperium.astroguide.model.entity.Conversation;
@@ -9,6 +10,7 @@ import com.imperium.astroguide.service.MessageService;
 import io.swagger.v3.oas.annotations.Operation;
 import io.swagger.v3.oas.annotations.Parameter;
 import io.swagger.v3.oas.annotations.tags.Tag;
+import jakarta.servlet.http.HttpServletRequest;
 import jakarta.validation.Valid;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
@@ -51,20 +53,22 @@ public class MessageController {
             @PathVariable String conversationId,
             @Parameter(description = "客户端标识", required = true)
             @RequestHeader(value = HEADER_CLIENT_ID, required = false) String clientId,
+            HttpServletRequest request,
             @Valid @RequestBody SubmitMessageRequest body) {
 
         if (clientId == null || clientId.isBlank()) {
-            return error(HttpStatus.BAD_REQUEST, "invalid_argument", "X-Client-Id is required", "header", HEADER_CLIENT_ID);
+            return error(HttpStatus.BAD_REQUEST, "invalid_argument", "X-Client-Id is required", "header", HEADER_CLIENT_ID,
+                    request);
         }
 
         String content = body.getContent();
 
         Conversation conversation = conversationService.getById(conversationId);
         if (conversation == null) {
-            return error(HttpStatus.NOT_FOUND, "not_found", "Conversation not found", null, null);
+            return error(HttpStatus.NOT_FOUND, "not_found", "Conversation not found", null, null, request);
         }
         if (!Objects.equals(conversation.getClientId(), clientId)) {
-            return error(HttpStatus.FORBIDDEN, "forbidden", "clientId does not match conversation", null, null);
+            return error(HttpStatus.FORBIDDEN, "forbidden", "clientId does not match conversation", null, null, request);
         }
 
         // 幂等：同一会话下相同 clientMessageId 且相同 content 才返回同一 messageId（仅对重试生效；新消息必生成新 ID）
@@ -143,11 +147,12 @@ public class MessageController {
     }
 
     private static ResponseEntity<Map<String, Object>> error(
-            HttpStatus status, String code, String message, String detailsKey, Object detailsValue) {
+            HttpStatus status, String code, String message, String detailsKey, Object detailsValue,
+            HttpServletRequest request) {
         Map<String, Object> err = new HashMap<>();
         err.put("code", code);
         err.put("message", message);
-        err.put("requestId", "req_" + UUID.randomUUID().toString().replace("-", "").substring(0, 16));
+        err.put("requestId", RequestIdSupport.resolve(request));
         if (detailsKey != null && detailsValue != null) {
             err.put("details", Map.of(detailsKey, detailsValue));
         }

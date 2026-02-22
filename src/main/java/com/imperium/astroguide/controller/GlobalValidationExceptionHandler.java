@@ -1,7 +1,11 @@
 package com.imperium.astroguide.controller;
 
+import com.imperium.astroguide.config.RequestIdSupport;
+import jakarta.servlet.http.HttpServletRequest;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
+import org.springframework.web.context.request.RequestContextHolder;
+import org.springframework.web.context.request.ServletRequestAttributes;
 import org.springframework.web.bind.MethodArgumentNotValidException;
 import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.annotation.RestControllerAdvice;
@@ -29,9 +33,19 @@ public class GlobalValidationExceptionHandler {
         Map<String, Object> err = new HashMap<>();
         err.put("code", "invalid_argument");
         err.put("message", message);
+        err.put("requestId", resolveRequestId());
         if (field != null) {
             err.put("details", Map.of("field", field));
         }
         return ResponseEntity.status(HttpStatus.BAD_REQUEST).body(Map.of("error", err));
+    }
+
+    private static String resolveRequestId() {
+        ServletRequestAttributes attributes = (ServletRequestAttributes) RequestContextHolder.getRequestAttributes();
+        if (attributes == null) {
+            return RequestIdSupport.newRequestId();
+        }
+        HttpServletRequest request = attributes.getRequest();
+        return RequestIdSupport.resolve(request);
     }
 }

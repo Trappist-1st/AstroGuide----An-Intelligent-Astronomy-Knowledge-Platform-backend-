@@ -1,4 +1,4 @@
-# AstroGuide
+# 🌌AstroGuide
 
 An intelligent astronomy knowledge platform MVP built with Spring Boot and Spring AI, featuring AI-powered chat, concept cards, and RAG (Retrieval-Augmented Generation) capabilities.
 

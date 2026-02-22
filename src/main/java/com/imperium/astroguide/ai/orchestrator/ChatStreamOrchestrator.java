@@ -10,7 +10,11 @@ import com.imperium.astroguide.service.ChatStreamService;
 import com.imperium.astroguide.service.ConversationService;
 import com.imperium.astroguide.service.MessageService;
 import com.imperium.astroguide.service.UsageService;
+import io.micrometer.core.instrument.MeterRegistry;
+import io.micrometer.core.instrument.Timer;
 import jakarta.servlet.http.HttpServletRequest;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.ai.chat.client.ChatClientResponse;
 import org.springframework.ai.chat.client.advisor.vectorstore.QuestionAnswerAdvisor;
 import org.springframework.ai.chat.memory.ChatMemory;
@@ -29,7 +33,8 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
-import java.util.UUID;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 
 /**
@@ -43,6 +48,8 @@ import java.util.concurrent.atomic.AtomicReference;
 @Service
 public class ChatStreamOrchestrator {
 
+    private static final Logger log = LoggerFactory.getLogger(ChatStreamOrchestrator.class);
+
     private final ConversationService conversationService;
     private final MessageService messageService;
     private final ChatStreamService chatStreamService;
@@ -50,6 +57,7 @@ public class ChatStreamOrchestrator {
     private final RateLimitPolicy rateLimitPolicy;
     private final ObjectMapper objectMapper;
     private final ChatMemory chatMemory;
+    private final MeterRegistry meterRegistry;
 
     @Value("${spring.ai.openai.chat.options.model:deepseek-chat}")
     private String defaultModel;
@@ -60,7 +68,8 @@ public class ChatStreamOrchestrator {
             UsageService usageService,
             RateLimitPolicy rateLimitPolicy,
             ObjectMapper objectMapper,
-            ChatMemory chatMemory) {
+            ChatMemory chatMemory,
+            MeterRegistry meterRegistry) {
         this.conversationService = conversationService;
         this.messageService = messageService;
         this.chatStreamService = chatStreamService;
@@ -68,6 +77,7 @@ public class ChatStreamOrchestrator {
         this.rateLimitPolicy = rateLimitPolicy;
         this.objectMapper = objectMapper;
         this.chatMemory = chatMemory;
+        this.meterRegistry = meterRegistry;
     }
 
     // ==================== 公开入口 ====================
@@ -75,31 +85,45 @@ public class ChatStreamOrchestrator {
     public Flux<ServerSentEvent<String>> stream(String conversationId,
             String messageId,
             String clientId,
+            String requestId,
             HttpServletRequest request) {
 
+        String resolvedRequestId = normalizeRequestId(requestId);
+
         // ---------- 1. 验证 ----------
-        ServerSentEvent<String> error = validate(conversationId, messageId, clientId, request);
+        ServerSentEvent<String> error = validate(conversationId, messageId, clientId, request, resolvedRequestId);
         if (error != null)
             return Flux.just(error);
 
+        incrementCounter("astroguide.chat.stream.request", "status", "accepted");
+        log.info("chat stream accepted requestId={} conversationId={} messageId={} clientId={}",
+                resolvedRequestId, conversationId, messageId, clientId);
+
         Conversation conversation = conversationService.getById(conversationId);
-        if (conversation == null)
-            return Flux.just(sseError("not_found", "Conversation not found", null));
-        if (!Objects.equals(conversation.getClientId(), clientId))
-            return Flux.just(sseError("forbidden", "clientId does not match conversation", null));
+        if (conversation == null) {
+            incrementCounter("astroguide.chat.stream.request", "status", "not_found");
+            return Flux.just(sseError("not_found", "Conversation not found", resolvedRequestId));
+        }
+        if (!Objects.equals(conversation.getClientId(), clientId)) {
+            incrementCounter("astroguide.chat.stream.request", "status", "forbidden");
+            return Flux.just(sseError("forbidden", "clientId does not match conversation", resolvedRequestId));
+        }
 
         Message userMessage = messageService.getById(messageId);
-        if (userMessage == null || !conversationId.equals(userMessage.getConversationId()))
-            return Flux.just(sseError("not_found", "Message not found", null));
-        if (!"user".equals(userMessage.getRole()))
-            return Flux.just(sseError("invalid_argument", "Message is not a user message", null));
+        if (userMessage == null || !conversationId.equals(userMessage.getConversationId())) {
+            incrementCounter("astroguide.chat.stream.request", "status", "not_found");
+            return Flux.just(sseError("not_found", "Message not found", resolvedRequestId));
+        }
+        if (!"user".equals(userMessage.getRole())) {
+            incrementCounter("astroguide.chat.stream.request", "status", "invalid_argument");
+            return Flux.just(sseError("invalid_argument", "Message is not a user message", resolvedRequestId));
+        }
 
         // ---------- 2. 准备参数 ----------
         String difficulty = userMessage.getDifficulty() != null ? userMessage.getDifficulty() : "intermediate";
         String language = userMessage.getLanguage() != null ? userMessage.getLanguage() : "en";
         String userQuestion = userMessage.getContent() != null ? userMessage.getContent() : "";
         int maxTokens = OutputLimitPolicy.getMaxCompletionTokens(difficulty);
-        String requestId = "req_" + UUID.randomUUID().toString().replace("-", "").substring(0, 16);
         String systemPrompt = buildSystemPrompt(difficulty, language);
         String assistantMessageId = messageId + "_a";
 
@@ -115,8 +139,10 @@ public class ChatStreamOrchestrator {
 
         // ---------- 3. Meta 事件 ----------
         Flux<ServerSentEvent<String>> metaFlux = Flux.just(
-                ServerSentEvent.<String>builder(toJson(Map.of(
-                        "requestId", requestId,
+                ServerSentEvent.builder(toJson(Map.of(
+                    "requestId", resolvedRequestId,
+                        "conversationId", conversationId,
+                        "messageId", messageId,
                         "model", defaultModel,
                         "difficulty", difficulty,
                         "language", language))).event("meta").build());
@@ -127,6 +153,7 @@ public class ChatStreamOrchestrator {
         AtomicReference<Integer> promptTokensRef = new AtomicReference<>();
         AtomicReference<Integer> completionTokensRef = new AtomicReference<>();
         AtomicReference<List<Document>> ragDocsRef = new AtomicReference<>();
+        AtomicBoolean streamFinalized = new AtomicBoolean(false);
 
         return metaFlux.concatWith(Flux.defer(() -> {
             Flux<ChatClientResponse> responseFlux = chatStreamService
@@ -175,6 +202,10 @@ public class ChatStreamOrchestrator {
                         "done", null, null, promptTok, completionTok, null);
                 usageService.record(assistantMessageId, defaultModel, latencyMs,
                         promptTok, completionTok, null);
+                markStreamFinalized(streamFinalized, "done", difficulty, latencyMs);
+                log.info("chat stream done requestId={} conversationId={} messageId={} latencyMs={} promptTokens={} completionTokens={} citations={}",
+                    resolvedRequestId, conversationId, messageId, latencyMs,
+                    promptTok, completionTok, citations.size());
 
                 return Flux.just(ServerSentEvent.<String>builder(toJson(donePayload)).event("done").build());
             }).subscribeOn(Schedulers.boundedElastic());
@@ -186,27 +217,69 @@ public class ChatStreamOrchestrator {
                                 "error", "provider_error",
                                 e.getMessage() != null ? e.getMessage() : "LLM stream failed",
                                 null, null, null);
+                        int latencyMs = (int) (System.currentTimeMillis() - startMs);
+                        markStreamFinalized(streamFinalized, "error", difficulty, latencyMs);
+                        log.warn(
+                            "chat stream error requestId={} conversationId={} messageId={} latencyMs={} error={}",
+                            resolvedRequestId, conversationId, messageId, latencyMs,
+                            e.getMessage());
                         return Flux.just(sseError("provider_error",
-                                e.getMessage() != null ? e.getMessage() : "LLM stream failed", requestId));
+                            e.getMessage() != null ? e.getMessage() : "LLM stream failed", resolvedRequestId));
                     }).subscribeOn(Schedulers.boundedElastic()))
                     .doOnCancel(() -> Schedulers.boundedElastic()
-                            .schedule(() -> finishAssistantMessage(assistantMessageId, contentAccumulator.toString(),
-                                    "cancelled", null, null, null, null, null)));
+                            .schedule(() -> {
+                            finishAssistantMessage(assistantMessageId, contentAccumulator.toString(),
+                                "cancelled", null, null, null, null, null);
+                            int latencyMs = (int) (System.currentTimeMillis() - startMs);
+                            markStreamFinalized(streamFinalized, "cancelled", difficulty, latencyMs);
+                            log.info("chat stream cancelled requestId={} conversationId={} messageId={} latencyMs={}",
+                                resolvedRequestId, conversationId, messageId, latencyMs);
+                            }));
         }));
     }
 
     // ==================== 私有：验证 ====================
 
     private ServerSentEvent<String> validate(String conversationId, String messageId,
-            String clientId, HttpServletRequest request) {
-        if (clientId == null || clientId.isBlank())
-            return sseError("invalid_argument", "X-Client-Id is required", null);
+            String clientId, HttpServletRequest request, String requestId) {
+        if (clientId == null || clientId.isBlank()) {
+            incrementCounter("astroguide.chat.stream.request", "status", "invalid_argument");
+            return sseError("invalid_argument", "X-Client-Id is required", requestId);
+        }
 
         String clientIp = request != null ? request.getRemoteAddr() : null;
-        if (!rateLimitPolicy.allow(clientId, clientIp))
-            return sseError("rate_limited", "Too many requests", null);
+        if (!rateLimitPolicy.allow(clientId, clientIp)) {
+            incrementCounter("astroguide.chat.stream.request", "status", "rate_limited");
+            return sseError("rate_limited", "Too many requests", requestId);
+        }
 
         return null; // 验证通过
+    }
+
+    private void markStreamFinalized(AtomicBoolean streamFinalized,
+            String status,
+            String difficulty,
+            int latencyMs) {
+        if (!streamFinalized.compareAndSet(false, true)) {
+            return;
+        }
+        incrementCounter("astroguide.chat.stream.terminal", "status", status);
+        Timer.builder("astroguide.chat.stream.latency")
+                .tag("status", status)
+                .tag("difficulty", difficulty)
+                .register(meterRegistry)
+                .record(latencyMs, TimeUnit.MILLISECONDS);
+    }
+
+    private void incrementCounter(String metricName, String... tags) {
+        meterRegistry.counter(metricName, tags).increment();
+    }
+
+    private String normalizeRequestId(String requestId) {
+        if (requestId != null && !requestId.isBlank()) {
+            return requestId;
+        }
+        return "req_unknown";
     }
 
     // ==================== 私有：ChatMemory 加载 ====================
@@ -343,6 +416,12 @@ public class ChatStreamOrchestrator {
             case "advanced" -> "You may use precise terminology and include formulas when helpful.";
             default -> "Explain clearly with moderate detail.";
         };
+        String formatConstraints = " Output format hard constraints (must follow strictly): "
+            + "(1) Keep one blank line before and after every Markdown heading. "
+            + "(2) Each list item must be on its own line; never place multiple list items on the same line. "
+            + "(3) Inline math must use $...$. "
+            + "(4) Block math must use $$...$$ as a standalone block. "
+            + "(5) Do a quick self-check before final output; if any rule is violated, rewrite to comply.";
         String markerProtocol = " For key terms or symbols, use markers: [[term:Term Name]] or [[sym:formula]]. "
                 + "Optional stable key: [[term:Name|key=id]]. "
                 + "Do not use [[...]] for anything other than term/sym markers.";
@@ -352,6 +431,7 @@ public class ChatStreamOrchestrator {
                 + "Use Markdown and LaTeX where appropriate. Do not fabricate citations."
                 + " When helpful for factual or encyclopedic topics (e.g. definitions, historical or current public knowledge), use the search_wikipedia tool to fetch and cite information; you do not need the user to explicitly ask for Wikipedia."
                 + " Answering boundary (RAG-first with general-knowledge supplement): (1) If reference materials are provided in the context, prioritize them and cite sources for the parts they cover. (2) If the user asks about multiple topics and only some are covered in the context, answer from context for those; for topics NOT in the context, do not refuse—briefly explain from your general knowledge and clearly label the boundary (e.g. in Chinese: \"资料中未提及，但一般意义上……\"; in English: \"The provided materials do not cover this; in general, …\"), then suggest consulting more resources. (3) When no reference context is provided or the context is empty, answer directly from your general astronomical knowledge; do not refuse or say the context is empty."
+                + formatConstraints
                 + markerProtocol;
     }
 
