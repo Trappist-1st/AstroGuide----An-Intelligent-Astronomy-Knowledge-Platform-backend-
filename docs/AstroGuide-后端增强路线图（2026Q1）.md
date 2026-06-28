@@ -23,10 +23,10 @@
 
 ---
 
-## 2. 当前现状（摘要）
+## 2. 当前现状（摘要，2026-06 更新）
 
-- 已有能力：会话与消息管理、SSE 流式回答、基础限流、RAG（可开关）、Tool Calling、Ingest。
-- 主要短板：请求追踪不统一、可观测弱、关键链路测试不足、RAG 链路仍有提效空间、Ingest 偏同步重任务。
+- 已有能力：LangGraph Agent Runtime（Phase 3 Workflow）、Multi-Agent 路由、ReAct 子图 + Checkpoint、Tool Registry + Policy、Session/Summary Memory、SSE 全事件（meta/delta/node/tool/route/review/done）、agent_runs 审计、RAG（可开关）、Ingest。
+- 主要短板：离线评测集、OTel 全链路追踪、Redis 分布式状态、子 Agent 委派、RAG 链路提效空间。
 
 ---
 

@@ -570,14 +570,17 @@ V0 不做 RAG。V1+ 方向：
 
 # 六、系统架构
 
-```
-Frontend (Vue)
-   ↓
-Backend (Spring Boot)
-   ↓
-AI Service Layer
-   ↓
-LLM API（V0）/ LLM API + Vector DB（V1+）
+> 当前实现已演进为 LangGraph Agent Runtime（Phase 3）。详见 [后端整体架构图](../docs/后端整体架构图.md)。
+
+```text
+Frontend (Vue 3)
+   │  REST + SSE
+   ▼
+Backend (Spring Boot, Java 21)
+   │  ChatStreamOrchestrator
+   │  LangGraph Agent Workflow + ReAct + Multi-Agent
+   ▼
+MySQL + Qdrant + LLM/Embedding API
 ```
 
 ---

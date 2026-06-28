@@ -1,21 +1,35 @@
 # 🌌 AstroGuide – V1.5 技术设计文档（TDD / Agent 形态）
 
-> 日期：2026-02-16  
-> 范围：在 V1（RAG + Wikipedia 固定管线）基础上，将问答链路升级为 **真正的智能体（Agent Loop）**：引入 Tools（Function Calling）与多步推理循环；RAG 仍可作为 Advisor（稳定底座），Wikipedia/概念卡等能力升级为 Tool（按需调用）。  
+> 日期：2026-02-16（架构更新：2026-06-28）  
+> 范围：在 V1（RAG + Wikipedia 固定管线）基础上，将问答链路升级为 **真正的智能体（Agent Loop）**：引入 Tools（Function Calling）与多步推理循环；RAG 仍可作为稳定底座，Wikipedia/概念卡等能力升级为 Tool（按需调用）。  
 > 关联文档：
 > - [docs/AstroGuide-V1-技术设计文档.md](./AstroGuide-V1-技术设计文档.md)
 > - [docs/V1-RAG-技术实现讨论.md](./V1-RAG-技术实现讨论.md)
+> - **[docs/后端整体架构图.md](./后端整体架构图.md) — 当前实现权威参考**
 
 ---
 
-## 0. 实现原则：仅用 Spring AI，无自研 Agent 循环
+## 0. 实现演进说明（2026-06 更新）
 
-**项目内只保留一套工具调用体系：Spring AI 的 @Tool + ChatClient.tools()。**
+本文档最初描述「仅用 Spring AI ChatClient 托管 Tool Calling」的 V1.5 形态。当前代码已演进为 **LangGraph4j Agent Runtime（Phase 3）**，在保留 Spring AI `@Tool` 定义的前提下，增加了：
 
-- **Tool 定义与注册**：使用 Spring AI 的 `@Tool`、`@ToolParam` 将每个工具拆分成独立类（`WikipediaTool`、`KnowledgeBaseTool`、`ConceptCardTool`），通过 `ChatClient.prompt().tools(wikipediaTool, knowledgeBaseTool, conceptCardTool)` 注册给模型。
-- **Tool 执行与多轮回填**：由 **Spring AI 的 ChatModel/ChatClient 内部机制托管**。模型返回 tool_calls → 框架解析并执行对应 `@Tool` 方法 → 将结果回填给模型 → 再调模型，直到模型输出最终 content。无需自研 JSON 协议、AgentOrchestrator 或 AgentToolRegistry。
-- **配置**：通过 `app.ai.tools.enabled` 控制是否向模型注册 tools；关闭则退化为仅 Advisor（RAG + 可选 Wikipedia 固定步骤）。不保留 `app.agent.*` 等自研 agent 配置。
-- **可观测性**：与 Spring AI 的 Tool 执行链路一致，便于与 Spring AI 生态的监控、日志对齐；当前实现不额外输出 tool_call/tool_result SSE 事件，如需可观测性增强，后续再评估基于日志/拦截器/响应扩展实现。
+- **Workflow 编排**：`AstroGuideWorkflowRunner` — route → retrieve → [plan] → prepare → react → review → finalize
+- **ReAct 子图**：LangGraph4j `AgentExecutor` + `MySqlCheckpointSaver`
+- **Multi-Agent**：Router / Planner / Reviewer
+- **Summary Memory**：异步滚动摘要
+- **可观测 SSE**：`node_*` / `tool_*` / `route` / `review` 事件 + `agent_runs` 审计
+
+Tool 定义仍使用 Spring AI `@Tool`（`WikipediaTool` / `KnowledgeBaseTool` / `ConceptCardTool`），通过 `ToolRegistry` 注册到 ReAct 子图；执行循环由 LangGraph4j 托管，而非 ChatClient 内部循环。
+
+---
+
+## 0.1 原始设计原则（V1.5 初版，已被 LangGraph 演进 supersede 部分条目）
+
+**Tool 定义与注册**：Spring AI `@Tool` + `ToolRegistry` → LangGraph ReAct 子图。
+
+- **Tool 执行与多轮回填**：由 **LangGraph4j AgentExecutor** 托管（ReAct 循环）；`ToolPolicyService` 负责预算/超时/审计。
+- **配置**：`app.ai.tools.enabled` 控制工具注册；`app.ai.runtime.*` 控制 ReAct 与工作流行为。
+- **可观测性**：SSE 输出 `tool_start` / `tool_done` / `node_start` / `node_done`；`agent_runs` 表持久化 run 级统计。
 
 ---
 
@@ -50,30 +64,39 @@
 
 ---
 
-## 3. V1.5 数据流（Agent Loop，由 Spring AI 托管）
+## 3. 数据流（当前实现：LangGraph Workflow + ReAct）
 
-### 3.1 单次问答（推荐链路）
-
-Tool 执行与多轮回填由 **Spring AI ChatClient 内部** 完成，应用层仅注册独立工具类并调用 `prompt().tools(wikipediaTool, knowledgeBaseTool, conceptCardTool).stream().chatClientResponse()`。
+### 3.1 单次问答（当前链路）
 
 ```
 用户问题
   ↓
-鉴权/限流/会话校验（V0）
+鉴权/限流/会话校验 + 加载 Session Memory + Summary Memory
   ↓
-[Advisors]
-  - ChatMemory 注入历史
-  - RAG：对当前问题检索一次，注入参考片段（可开关）
+SSE meta
   ↓
-构造 Prompt（System + 历史 + 当前问题 + [参考]）并注册 Tools（WikipediaTool / KnowledgeBaseTool / ConceptCardTool）
+[Workflow: AstroGuideWorkflowRunner]
+  route ──► retrieve_knowledge（RAG，可开关）
+        ──► [plan]（COMPLEX 路径）
+        ──► prepare_context（System + 历史 + RAG + Summary + Plan）
+        ──► react_agent（LangGraph ReAct 子图）
+              ├─ agent → tool_calls? → ToolRegistry 执行 @Tool → 回填 → 循环
+              └─ 流式 delta
+        ──► review_answer（规则 + COMPLEX 时 LLM 修订）
+        ──► finalize
   ↓
-ChatClient.stream().chatClientResponse()（Spring AI 内部）
-  - 若模型返回 tool_calls → 框架执行 @Tool 方法 → 结果回填 → 再调模型（循环）
-  - 若模型返回最终 content → 流式 delta → done
+SSE：meta → [route] → [node_*] → delta → [tool_*] → [review] → done
   ↓
-SSE：meta → delta → done
-  ↓
-落库 assistant + usage
+落库 assistant + usage + agent_runs；异步 Summary Memory 入队
+```
+
+### 3.1.1 初版 V1.5 数据流（历史记录：Spring AI ChatClient 托管）
+
+> 以下为 2026-02 初版设计，已被 LangGraph Workflow 替代，保留作演进参考。
+
+```
+用户问题 → 鉴权 → ChatMemory + RAG Advisor → ChatClient.tools(...).stream()
+  → Spring AI 内部 tool loop → SSE meta/delta/done → 落库
 ```
 
 ### 3.2 为什么仍保留“RAG 作为 Advisor”
@@ -293,39 +316,37 @@ V1.5 最小可用组合（强烈建议先实现这 3 个）：
 
 ---
 
-## 7. SSE 事件扩展（推荐）
+## 7. SSE 事件（当前实现）
 
-当前实现不输出 tool_call/tool_result SSE 事件（保持协议简单稳定）：
-- `meta` / `delta` / `done` / `error`
+| 事件 | 开关 | 说明 |
+|------|------|------|
+| `meta` | 始终 | requestId, runId 等 |
+| `delta` | 始终 | 流式文本 |
+| `node_start` / `node_done` | `app.ai.runtime.emit-node-events` | 工作流节点 |
+| `tool_start` / `tool_done` | `app.ai.runtime.emit-tool-events` | Tool 调用过程 |
+| `route` | `app.ai.runtime.emit-route-events` | SIMPLE / COMPLEX 分流 |
+| `review` | `app.ai.runtime.emit-route-events` | 审查结果 |
+| `done` | 始终 | usage, citations, route, review, toolCalls |
+| `error` | 始终 | 错误信息 |
 
-如未来需要可视化与可追溯，可**选做**扩展两类事件（旧客户端可忽略；当前未实现）：
-
-- `event: tool_call`
-  - data：`{ "name": "search_wikipedia", "arguments": { ... }, "step": 2 }`
-- `event: tool_result`
-  - data：`{ "name": "search_wikipedia", "ok": true, "result": { ... }, "step": 2 }`
-
-现有事件保持：
-- `meta` / `delta` / `done` / `error`
-
-`done.citations` 当前以 Advisor（RAG/Wikipedia Advisor）来源为主；Tool 来源 citations 若需要对前端透出，需后续做响应扩展或在 Tool 返回结构中约定并落库。
+`done.citations` 以 RAG retrieve 节点 + Tool 执行结果合并；详见 [后端整体架构图 §7](./后端整体架构图.md)。
 
 ---
 
-## 8. 后端模块拆分与落地建议（与现有重构对齐）
+## 8. 后端模块拆分（当前实现）
 
-采用 **仅 Spring AI** 时，Tool 执行与多轮回填由 ChatModel/ChatClient 托管，无需自研 ToolExecutor 或 Agent 状态机。推荐分工：
-
-- `ChatStreamOrchestrator`
-  - 负责鉴权、参数组装、调用 `ChatStreamService.streamChatClientResponses(..., toolCallingEnabled)`，以及 SSE 组装（meta/delta/done）、citations 合并、落库
-- `ChatStreamServiceImpl`
-  - 负责 `prompt().advisors(...).tools(astroGuideToolset).stream().chatClientResponse()`；Advisor 与 Tool 注册在此完成，循环由 Spring AI 内部完成
-- `WikipediaTool` / `KnowledgeBaseTool` / `ConceptCardTool`
-  - 每个工具类各自承载一个 @Tool 方法，由 Spring AI 框架在生成过程中按需调用
-- `ChatMemoryPrimer` / 对话历史
-  - 负责对话历史 prime（增量/重建），通过 MessageChatMemoryAdvisor 注入
-- citations 的构建与合并
-  - 目前由 Orchestrator 从 Advisor 响应上下文合并；Tool 来源的 citations 可后续基于 Spring AI 响应扩展
+| 模块 | 路径 | 职责 |
+|------|------|------|
+| SSE 编排 | `ai/orchestrator/ChatStreamOrchestrator` | 鉴权、Memory 加载、SSE 映射、落库 |
+| Agent Runtime | `ai/runtime/LangGraphAgentRunner` | 委托 Workflow，管理 run 生命周期 |
+| Workflow | `ai/graph/AstroGuideWorkflowRunner` | Phase 3 七节点编排 |
+| ReAct 子图 | `ai/graph/AgentGraphConfig` | LangGraph AgentExecutor + Checkpoint |
+| Tool 体系 | `ai/tool/` + `ai/tools/` | Registry、Policy、@Tool 实现 |
+| Multi-Agent | `ai/multiagent/` | Router / Planner / Reviewer |
+| Memory | `ai/memory/` | Session + Summary + 异步 Worker |
+| Context | `ai/context/` | 组装、裁剪、Token 估算 |
+| RAG | `ai/rag/RagRetrievalService` | retrieve_knowledge 节点 |
+| Run 审计 | `service/AgentRunService` | agent_runs 持久化 |
 
 ---
 
