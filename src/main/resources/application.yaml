@@ -56,10 +56,37 @@ app:
     allowed-origins: ${CORS_ALLOWED_ORIGINS:http://localhost:5173}
   concept-card:
     generate-on-miss: true
-  # 工具调用：仅使用 Spring AI @Tool + .tools()，由 ChatModel 托管 tool 执行与多轮回填（无自研 agent 循环）
+  # 工具调用：LangGraph AgentExecutor + ToolRegistry
   ai:
     tools:
       enabled: ${APP_AI_TOOLS_ENABLED:true}
+      timeout-ms: ${APP_AI_TOOLS_TIMEOUT_MS:3000}
+      max-calls-total: ${APP_AI_TOOLS_MAX_CALLS_TOTAL:4}
+      max-calls-per-tool: ${APP_AI_TOOLS_MAX_CALLS_PER_TOOL:2}
+    runtime:
+      mode: langgraph
+      recursion-limit: ${APP_AI_RUNTIME_RECURSION_LIMIT:12}
+      emit-node-events: ${APP_AI_RUNTIME_EMIT_NODE_EVENTS:true}
+      emit-tool-events: ${APP_AI_RUNTIME_EMIT_TOOL_EVENTS:true}
+      emit-route-events: ${APP_AI_RUNTIME_EMIT_ROUTE_EVENTS:true}
+    context:
+      max-rounds: ${APP_AI_CONTEXT_MAX_ROUNDS:8}
+      max-history-chars: ${APP_AI_CONTEXT_MAX_HISTORY_CHARS:12000}
+    memory:
+      max-messages: ${APP_AI_MEMORY_MAX_MESSAGES:16}
+      summary-debounce-ms: ${APP_AI_MEMORY_SUMMARY_DEBOUNCE_MS:5000}
+      summary-min-messages: ${APP_AI_MEMORY_SUMMARY_MIN_MESSAGES:6}
+      summary-window: ${APP_AI_MEMORY_SUMMARY_WINDOW:24}
+    router:
+      enabled: ${APP_AI_ROUTER_ENABLED:true}
+      complex-min-chars: ${APP_AI_ROUTER_COMPLEX_MIN_CHARS:120}
+      multi-question-threshold: ${APP_AI_ROUTER_MULTI_QUESTION_THRESHOLD:2}
+    planner:
+      enabled: ${APP_AI_PLANNER_ENABLED:true}
+    reviewer:
+      enabled: ${APP_AI_REVIEWER_ENABLED:true}
+      llm-for-complex: ${APP_AI_REVIEWER_LLM_FOR_COMPLEX:true}
+      min-answer-chars: ${APP_AI_REVIEWER_MIN_ANSWER_CHARS:40}
   # RAG 知识库（V1）：开关与检索参数
   rag:
     enabled: ${RAG_ENABLED:false}

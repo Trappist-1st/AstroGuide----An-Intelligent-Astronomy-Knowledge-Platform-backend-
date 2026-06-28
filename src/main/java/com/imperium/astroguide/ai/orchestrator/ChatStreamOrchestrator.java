@@ -1,12 +1,18 @@
 package com.imperium.astroguide.ai.orchestrator;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.imperium.astroguide.ai.memory.MemoryUpdateQueue;
+import com.imperium.astroguide.ai.memory.SessionMemoryService;
+import com.imperium.astroguide.ai.memory.SummaryMemoryService;
+import com.imperium.astroguide.ai.runtime.AgentRunRequest;
+import com.imperium.astroguide.ai.runtime.AgentRunResult;
+import com.imperium.astroguide.ai.runtime.AgentRuntime;
+import com.imperium.astroguide.ai.runtime.AgentStreamEvent;
+import com.imperium.astroguide.ai.tool.ToolExecutionRecord;
 import com.imperium.astroguide.model.dto.rag.CitationDto;
 import com.imperium.astroguide.model.entity.Conversation;
-import com.imperium.astroguide.model.entity.Message;
 import com.imperium.astroguide.policy.OutputLimitPolicy;
 import com.imperium.astroguide.policy.RateLimitPolicy;
-import com.imperium.astroguide.service.ChatStreamService;
 import com.imperium.astroguide.service.ConversationService;
 import com.imperium.astroguide.service.MessageService;
 import com.imperium.astroguide.service.UsageService;
@@ -15,24 +21,18 @@ import io.micrometer.core.instrument.Timer;
 import jakarta.servlet.http.HttpServletRequest;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import org.springframework.ai.chat.client.ChatClientResponse;
-import org.springframework.ai.chat.client.advisor.vectorstore.QuestionAnswerAdvisor;
-import org.springframework.ai.chat.memory.ChatMemory;
-import org.springframework.ai.chat.messages.AssistantMessage;
-import org.springframework.ai.chat.messages.UserMessage;
-import org.springframework.ai.chat.model.ChatResponse;
-import org.springframework.ai.document.Document;
+import org.springframework.ai.chat.messages.Message;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.http.codec.ServerSentEvent;
 import org.springframework.stereotype.Service;
 import reactor.core.publisher.Flux;
 import reactor.core.scheduler.Schedulers;
 
-import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.UUID;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
@@ -40,10 +40,7 @@ import java.util.concurrent.atomic.AtomicReference;
 /**
  * SSE 流式对话编排器。
  * <p>
- * 职责：请求验证 → 限流 → 加载历史记忆 → 调用 ChatStreamService 流式生成 → 落库 → SSE 事件组装。
- * <p>
- * RAG、Tool Calling、ChatMemory 等能力由 {@link ChatStreamService} 内部管理，
- * 本类不关心具体开关和实现细节。
+ * 职责：请求验证 → 限流 → 加载历史 → 调用 {@link AgentRuntime}（LangGraph）→ 落库 → SSE 事件组装。
  */
 @Service
 public class ChatStreamOrchestrator {
@@ -52,35 +49,48 @@ public class ChatStreamOrchestrator {
 
     private final ConversationService conversationService;
     private final MessageService messageService;
-    private final ChatStreamService chatStreamService;
+    private final AgentRuntime agentRuntime;
     private final UsageService usageService;
     private final RateLimitPolicy rateLimitPolicy;
     private final ObjectMapper objectMapper;
-    private final ChatMemory chatMemory;
+    private final SessionMemoryService sessionMemoryService;
+    private final SummaryMemoryService summaryMemoryService;
+    private final MemoryUpdateQueue memoryUpdateQueue;
     private final MeterRegistry meterRegistry;
 
     @Value("${spring.ai.openai.chat.options.model:deepseek-chat}")
     private String defaultModel;
 
+    @Value("${app.ai.runtime.emit-node-events:true}")
+    private boolean emitNodeEvents;
+
+    @Value("${app.ai.runtime.emit-tool-events:true}")
+    private boolean emitToolEvents;
+
+    @Value("${app.ai.runtime.emit-route-events:true}")
+    private boolean emitRouteEvents;
+
     public ChatStreamOrchestrator(ConversationService conversationService,
             MessageService messageService,
-            ChatStreamService chatStreamService,
+            AgentRuntime agentRuntime,
             UsageService usageService,
             RateLimitPolicy rateLimitPolicy,
             ObjectMapper objectMapper,
-            ChatMemory chatMemory,
+            SessionMemoryService sessionMemoryService,
+            SummaryMemoryService summaryMemoryService,
+            MemoryUpdateQueue memoryUpdateQueue,
             MeterRegistry meterRegistry) {
         this.conversationService = conversationService;
         this.messageService = messageService;
-        this.chatStreamService = chatStreamService;
+        this.agentRuntime = agentRuntime;
         this.usageService = usageService;
         this.rateLimitPolicy = rateLimitPolicy;
         this.objectMapper = objectMapper;
-        this.chatMemory = chatMemory;
+        this.sessionMemoryService = sessionMemoryService;
+        this.summaryMemoryService = summaryMemoryService;
+        this.memoryUpdateQueue = memoryUpdateQueue;
         this.meterRegistry = meterRegistry;
     }
-
-    // ==================== 公开入口 ====================
 
     public Flux<ServerSentEvent<String>> stream(String conversationId,
             String messageId,
@@ -89,15 +99,16 @@ public class ChatStreamOrchestrator {
             HttpServletRequest request) {
 
         String resolvedRequestId = normalizeRequestId(requestId);
+        String runId = newRunId();
 
-        // ---------- 1. 验证 ----------
         ServerSentEvent<String> error = validate(conversationId, messageId, clientId, request, resolvedRequestId);
-        if (error != null)
+        if (error != null) {
             return Flux.just(error);
+        }
 
         incrementCounter("astroguide.chat.stream.request", "status", "accepted");
-        log.info("chat stream accepted requestId={} conversationId={} messageId={} clientId={}",
-                resolvedRequestId, conversationId, messageId, clientId);
+        log.info("chat stream accepted requestId={} runId={} conversationId={} messageId={} clientId={}",
+                resolvedRequestId, runId, conversationId, messageId, clientId);
 
         Conversation conversation = conversationService.getById(conversationId);
         if (conversation == null) {
@@ -109,7 +120,7 @@ public class ChatStreamOrchestrator {
             return Flux.just(sseError("forbidden", "clientId does not match conversation", resolvedRequestId));
         }
 
-        Message userMessage = messageService.getById(messageId);
+        com.imperium.astroguide.model.entity.Message userMessage = messageService.getById(messageId);
         if (userMessage == null || !conversationId.equals(userMessage.getConversationId())) {
             incrementCounter("astroguide.chat.stream.request", "status", "not_found");
             return Flux.just(sseError("not_found", "Message not found", resolvedRequestId));
@@ -119,126 +130,206 @@ public class ChatStreamOrchestrator {
             return Flux.just(sseError("invalid_argument", "Message is not a user message", resolvedRequestId));
         }
 
-        // ---------- 2. 准备参数 ----------
         String difficulty = userMessage.getDifficulty() != null ? userMessage.getDifficulty() : "intermediate";
         String language = userMessage.getLanguage() != null ? userMessage.getLanguage() : "en";
         String userQuestion = userMessage.getContent() != null ? userMessage.getContent() : "";
         int maxTokens = OutputLimitPolicy.getMaxCompletionTokens(difficulty);
         String systemPrompt = buildSystemPrompt(difficulty, language);
         String assistantMessageId = messageId + "_a";
+        List<Message> historyMessages = sessionMemoryService.loadHistory(conversationId, userMessage);
+        String conversationSummary = summaryMemoryService.loadSummary(conversationId);
 
-        // 首次请求时，将 DB 中历史消息加载到 ChatMemory（一次性，非增量）
-        ensureChatMemoryLoaded(conversationId, userMessage);
-
-        // 标记 assistant 消息为 streaming
-        Message assistantMsg = messageService.getById(assistantMessageId);
+        com.imperium.astroguide.model.entity.Message assistantMsg = messageService.getById(assistantMessageId);
         if (assistantMsg != null) {
             assistantMsg.setStatus("streaming");
             messageService.updateById(assistantMsg);
         }
 
-        // ---------- 3. Meta 事件 ----------
+        AgentRunRequest runRequest = new AgentRunRequest(
+                runId,
+                resolvedRequestId,
+                conversationId,
+                messageId,
+                systemPrompt,
+                userQuestion,
+                historyMessages,
+                maxTokens,
+                List.of(),
+                conversationSummary);
+
         Flux<ServerSentEvent<String>> metaFlux = Flux.just(
                 ServerSentEvent.builder(toJson(Map.of(
-                    "requestId", resolvedRequestId,
+                        "requestId", resolvedRequestId,
+                        "runId", runId,
                         "conversationId", conversationId,
                         "messageId", messageId,
                         "model", defaultModel,
                         "difficulty", difficulty,
-                        "language", language))).event("meta").build());
+                        "language", language,
+                        "runtime", "langgraph"))).event("meta").build());
 
-        // ---------- 4. 流式 LLM 调用 + SSE ----------
         long startMs = System.currentTimeMillis();
         StringBuilder contentAccumulator = new StringBuilder();
-        AtomicReference<Integer> promptTokensRef = new AtomicReference<>();
-        AtomicReference<Integer> completionTokensRef = new AtomicReference<>();
-        AtomicReference<List<Document>> ragDocsRef = new AtomicReference<>();
+        AtomicReference<AgentRunResult> runResultRef = new AtomicReference<>();
+        AtomicReference<String> reviewOverrideRef = new AtomicReference<>();
         AtomicBoolean streamFinalized = new AtomicBoolean(false);
 
         return metaFlux.concatWith(Flux.defer(() -> {
-            Flux<ChatClientResponse> responseFlux = chatStreamService
-                    .streamChatClientResponses(conversationId, systemPrompt, userQuestion, maxTokens)
-                    .doOnNext(r -> {
-                        captureUsage(r, promptTokensRef, completionTokensRef);
-                        captureRagDocuments(r, ragDocsRef);
-                    });
+            Flux<ServerSentEvent<String>> runtimeFlux = agentRuntime.stream(runRequest)
+                    .flatMap(event -> mapRuntimeEvent(event, contentAccumulator, runResultRef, reviewOverrideRef));
 
-            // delta 事件：按块缓冲，减少「一词一 event」，每约 10 个 token 或合并后发一条
-            Flux<ServerSentEvent<String>> deltaFlux = responseFlux
-                    .map(ChatStreamOrchestrator::extractDeltaText)
-                    .filter(s -> s != null && !s.isBlank())
-                    .buffer(10)
-                    .map(chunks -> String.join("", chunks))
-                    .filter(s -> !s.isEmpty())
-                    .doOnNext(contentAccumulator::append)
-                    .map(chunk -> ServerSentEvent.<String>builder(
-                            toJson(Map.of("text", chunk))).event("delta").build());
-
-            // done 事件
             Flux<ServerSentEvent<String>> doneFlux = Flux.defer(() -> {
                 int latencyMs = (int) (System.currentTimeMillis() - startMs);
-                Integer promptTok = promptTokensRef.get();
-                Integer completionTok = completionTokensRef.get();
+                AgentRunResult result = runResultRef.get();
+                String finalContent = resolveFinalContent(contentAccumulator, reviewOverrideRef, result);
+                Integer promptTok = result != null ? result.promptTokens() : null;
+                Integer completionTok = result != null ? result.completionTokens() : null;
+                List<CitationDto> citations = result != null && result.citations() != null
+                        ? result.citations()
+                        : List.of();
 
-                Map<String, Object> donePayload = new HashMap<>(Map.of("status", "done"));
+                Map<String, Object> donePayload = new HashMap<>(Map.of("status", "done", "runId", runId));
                 if (promptTok != null || completionTok != null) {
                     Map<String, Object> usage = new HashMap<>();
-                    if (promptTok != null)
+                    if (promptTok != null) {
                         usage.put("promptTokens", promptTok);
-                    if (completionTok != null)
+                    }
+                    if (completionTok != null) {
                         usage.put("completionTokens", completionTok);
+                    }
                     donePayload.put("usage", usage);
                 }
-
-                List<CitationDto> citations = buildCitations(ragDocsRef.get());
                 if (!citations.isEmpty()) {
                     donePayload.put("citations", citations.stream().map(c -> Map.of(
                             "chunkId", c.getChunkId() != null ? c.getChunkId() : "",
                             "source", c.getSource() != null ? c.getSource() : "",
                             "excerpt", c.getExcerpt() != null ? c.getExcerpt() : "")).toList());
                 }
+                if (result != null && result.toolExecutions() != null && !result.toolExecutions().isEmpty()) {
+                    donePayload.put("toolCalls", result.toolExecutions().size());
+                }
+                if (result != null && result.estimatedInputTokens() != null) {
+                    donePayload.put("estimatedInputTokens", result.estimatedInputTokens());
+                }
+                if (result != null && result.routeMode() != null) {
+                    donePayload.put("route", Map.of(
+                            "mode", result.routeMode(),
+                            "reason", result.routeReason() != null ? result.routeReason() : ""));
+                }
+                if (result != null && result.reviewPassed() != null) {
+                    donePayload.put("review", Map.of(
+                            "passed", result.reviewPassed(),
+                            "reason", result.reviewReason() != null ? result.reviewReason() : ""));
+                }
 
-                finishAssistantMessage(assistantMessageId, contentAccumulator.toString(),
+                memoryUpdateQueue.enqueue(conversationId);
+
+                finishAssistantMessage(assistantMessageId, finalContent,
                         "done", null, null, promptTok, completionTok, null);
-                usageService.record(assistantMessageId, defaultModel, latencyMs,
-                        promptTok, completionTok, null);
+                usageService.record(assistantMessageId, defaultModel, latencyMs, promptTok, completionTok, null);
                 markStreamFinalized(streamFinalized, "done", difficulty, latencyMs);
-                log.info("chat stream done requestId={} conversationId={} messageId={} latencyMs={} promptTokens={} completionTokens={} citations={}",
-                    resolvedRequestId, conversationId, messageId, latencyMs,
-                    promptTok, completionTok, citations.size());
+                log.info("chat stream done requestId={} runId={} conversationId={} messageId={} latencyMs={} toolCalls={}",
+                        resolvedRequestId, runId, conversationId, messageId, latencyMs,
+                        result != null && result.toolExecutions() != null ? result.toolExecutions().size() : 0);
 
                 return Flux.just(ServerSentEvent.<String>builder(toJson(donePayload)).event("done").build());
             }).subscribeOn(Schedulers.boundedElastic());
 
-            return deltaFlux
+            return runtimeFlux
                     .concatWith(doneFlux)
                     .onErrorResume(e -> Flux.defer(() -> {
                         finishAssistantMessage(assistantMessageId, contentAccumulator.toString(),
                                 "error", "provider_error",
-                                e.getMessage() != null ? e.getMessage() : "LLM stream failed",
+                                e.getMessage() != null ? e.getMessage() : "Agent runtime failed",
                                 null, null, null);
                         int latencyMs = (int) (System.currentTimeMillis() - startMs);
                         markStreamFinalized(streamFinalized, "error", difficulty, latencyMs);
-                        log.warn(
-                            "chat stream error requestId={} conversationId={} messageId={} latencyMs={} error={}",
-                            resolvedRequestId, conversationId, messageId, latencyMs,
-                            e.getMessage());
+                        log.warn("chat stream error requestId={} runId={} conversationId={} messageId={} latencyMs={} error={}",
+                                resolvedRequestId, runId, conversationId, messageId, latencyMs, e.getMessage());
                         return Flux.just(sseError("provider_error",
-                            e.getMessage() != null ? e.getMessage() : "LLM stream failed", resolvedRequestId));
+                                e.getMessage() != null ? e.getMessage() : "Agent runtime failed", resolvedRequestId));
                     }).subscribeOn(Schedulers.boundedElastic()))
-                    .doOnCancel(() -> Schedulers.boundedElastic()
-                            .schedule(() -> {
-                            finishAssistantMessage(assistantMessageId, contentAccumulator.toString(),
+                    .doOnCancel(() -> Schedulers.boundedElastic().schedule(() -> {
+                        finishAssistantMessage(assistantMessageId, contentAccumulator.toString(),
                                 "cancelled", null, null, null, null, null);
-                            int latencyMs = (int) (System.currentTimeMillis() - startMs);
-                            markStreamFinalized(streamFinalized, "cancelled", difficulty, latencyMs);
-                            log.info("chat stream cancelled requestId={} conversationId={} messageId={} latencyMs={}",
-                                resolvedRequestId, conversationId, messageId, latencyMs);
-                            }));
+                        int latencyMs = (int) (System.currentTimeMillis() - startMs);
+                        markStreamFinalized(streamFinalized, "cancelled", difficulty, latencyMs);
+                        log.info("chat stream cancelled requestId={} runId={} conversationId={} messageId={} latencyMs={}",
+                                resolvedRequestId, runId, conversationId, messageId, latencyMs);
+                    }));
         }));
     }
 
-    // ==================== 私有：验证 ====================
+    private Flux<ServerSentEvent<String>> mapRuntimeEvent(AgentStreamEvent event,
+            StringBuilder contentAccumulator,
+            AtomicReference<AgentRunResult> runResultRef,
+            AtomicReference<String> reviewOverrideRef) {
+        if (event instanceof AgentStreamEvent.TextDelta delta) {
+            if (delta.text() == null || delta.text().isBlank()) {
+                return Flux.empty();
+            }
+            contentAccumulator.append(delta.text());
+            return Flux.just(ServerSentEvent.<String>builder(
+                    toJson(Map.of("text", delta.text()))).event("delta").build());
+        }
+        if (event instanceof AgentStreamEvent.RunFinished finished) {
+            runResultRef.set(finished.result());
+            return Flux.empty();
+        }
+        if (event instanceof AgentStreamEvent.ReviewCompleted review
+                && review.finalTextOverride() != null && !review.finalTextOverride().isBlank()) {
+            reviewOverrideRef.set(review.finalTextOverride());
+        }
+        if (emitNodeEvents && event instanceof AgentStreamEvent.NodeStarted nodeStarted) {
+            return Flux.just(ServerSentEvent.<String>builder(
+                    toJson(Map.of("node", nodeStarted.nodeId()))).event("node_start").build());
+        }
+        if (emitNodeEvents && event instanceof AgentStreamEvent.NodeFinished nodeFinished) {
+            return Flux.just(ServerSentEvent.<String>builder(toJson(Map.of(
+                    "node", nodeFinished.nodeId(),
+                    "latencyMs", nodeFinished.latencyMs()))).event("node_done").build());
+        }
+        if (emitToolEvents && event instanceof AgentStreamEvent.ToolStarted toolStarted) {
+            return Flux.just(ServerSentEvent.<String>builder(toJson(Map.of(
+                    "tool", toolStarted.toolName(),
+                    "arguments", toolStarted.arguments() != null ? toolStarted.arguments() : ""))).event("tool_start").build());
+        }
+        if (emitToolEvents && event instanceof AgentStreamEvent.ToolFinished toolFinished) {
+            ToolExecutionRecord record = toolFinished.record();
+            return Flux.just(ServerSentEvent.<String>builder(toJson(Map.of(
+                    "tool", record.getToolName(),
+                    "success", record.isSuccess(),
+                    "latencyMs", record.getLatencyMs()))).event("tool_done").build());
+        }
+        if (emitRouteEvents && event instanceof AgentStreamEvent.RouteSelected route) {
+            return Flux.just(ServerSentEvent.<String>builder(toJson(Map.of(
+                    "mode", route.mode(),
+                    "reasonCode", route.reasonCode(),
+                    "confidence", route.confidence()))).event("route").build());
+        }
+        if (emitRouteEvents && event instanceof AgentStreamEvent.ReviewCompleted review) {
+            Map<String, Object> payload = new HashMap<>(Map.of(
+                    "passed", review.passed(),
+                    "reasonCode", review.reasonCode()));
+            if (review.finalTextOverride() != null) {
+                payload.put("revised", true);
+            }
+            return Flux.just(ServerSentEvent.<String>builder(toJson(payload)).event("review").build());
+        }
+        return Flux.empty();
+    }
+
+    private static String resolveFinalContent(StringBuilder contentAccumulator,
+            AtomicReference<String> reviewOverrideRef,
+            AgentRunResult result) {
+        if (reviewOverrideRef.get() != null && !reviewOverrideRef.get().isBlank()) {
+            return reviewOverrideRef.get();
+        }
+        if (result != null && result.finalText() != null && !result.finalText().isBlank()) {
+            return result.finalText();
+        }
+        return contentAccumulator.toString();
+    }
 
     private ServerSentEvent<String> validate(String conversationId, String messageId,
             String clientId, HttpServletRequest request, String requestId) {
@@ -253,7 +344,7 @@ public class ChatStreamOrchestrator {
             return sseError("rate_limited", "Too many requests", requestId);
         }
 
-        return null; // 验证通过
+        return null;
     }
 
     private void markStreamFinalized(AtomicBoolean streamFinalized,
@@ -282,121 +373,17 @@ public class ChatStreamOrchestrator {
         return "req_unknown";
     }
 
-    // ==================== 私有：ChatMemory 加载 ====================
-
-    /**
-     * 若 ChatMemory 中还没有该会话的历史消息，则从 DB 一次性加载最近的历史记录。
-     * <p>
-     * 取代了原来的 primeChatMemoryFromDb / rebuildChatMemoryFromDb /
-     * incrementalPrimeChatMemoryFromDb
-     * 以及 ChatMemoryPrimeTracker 的增量游标机制。
-     */
-    private void ensureChatMemoryLoaded(String conversationId, Message currentUserMessage) {
-        if (conversationId == null || conversationId.isBlank())
-            return;
-        if (currentUserMessage.getCreatedAt() == null)
-            return;
-
-        var existing = chatMemory.get(conversationId);
-        if (!existing.isEmpty())
-            return; // 已加载过
-
-        List<Message> history = messageService.lambdaQuery()
-                .eq(Message::getConversationId, conversationId)
-                .lt(Message::getCreatedAt, currentUserMessage.getCreatedAt())
-                .orderByAsc(Message::getCreatedAt)
-                .last("LIMIT 16")
-                .list();
-
-        List<org.springframework.ai.chat.messages.Message> memoryMsgs = new ArrayList<>();
-        for (Message m : history) {
-            if (m == null || m.getContent() == null || m.getContent().isBlank())
-                continue;
-            if ("assistant".equals(m.getRole())) {
-                if ("queued".equalsIgnoreCase(m.getStatus()))
-                    continue;
-                memoryMsgs.add(new AssistantMessage(m.getContent()));
-            } else {
-                memoryMsgs.add(new UserMessage(m.getContent()));
-            }
-        }
-
-        if (!memoryMsgs.isEmpty()) {
-            chatMemory.add(conversationId, memoryMsgs);
-        }
+    private static String newRunId() {
+        return "run_" + UUID.randomUUID().toString().replace("-", "").substring(0, 16);
     }
-
-    // ==================== 私有：响应提取 ====================
-
-    /** 从流式 ChatResponse 中获取真实 Usage（由 LLM 提供商返回） */
-    private static void captureUsage(ChatClientResponse response,
-            AtomicReference<Integer> promptRef,
-            AtomicReference<Integer> completionRef) {
-        if (response == null || response.chatResponse() == null)
-            return;
-        ChatResponse cr = response.chatResponse();
-        if (cr.getMetadata().getUsage() == null)
-            return;
-
-        var usage = cr.getMetadata().getUsage();
-        if (usage.getPromptTokens() != null && usage.getPromptTokens() > 0)
-            promptRef.set(usage.getPromptTokens());
-        if (usage.getCompletionTokens() != null && usage.getCompletionTokens() > 0)
-            completionRef.set(usage.getCompletionTokens());
-    }
-
-    /** 捕获 RAG advisor 检索到的文档（用于生成 citations） */
-    private static void captureRagDocuments(ChatClientResponse response,
-            AtomicReference<List<Document>> ragDocsRef) {
-        if (ragDocsRef.get() != null)
-            return;
-        if (response == null)
-            return;
-        Object ragObj = response.context().get(QuestionAnswerAdvisor.RETRIEVED_DOCUMENTS);
-        if (ragObj instanceof List<?> list && !list.isEmpty() && list.get(0) instanceof Document) {
-            @SuppressWarnings("unchecked")
-            List<Document> docs = (List<Document>) list;
-            ragDocsRef.set(docs);
-        }
-    }
-
-    private static String extractDeltaText(ChatClientResponse response) {
-        if (response == null || response.chatResponse() == null) {
-            return null;
-        }
-        return response.chatResponse().getResult().getOutput().getText();
-    }
-
-    // ==================== 私有：Citations ====================
-
-    private static List<CitationDto> buildCitations(List<Document> docs) {
-        if (docs == null || docs.isEmpty())
-            return List.of();
-        List<CitationDto> citations = new ArrayList<>();
-        for (int i = 0; i < docs.size(); i++) {
-            Document d = docs.get(i);
-            if (d == null || d.getText() == null || d.getText().isBlank())
-                continue;
-            Map<String, Object> meta = d.getMetadata();
-            String source = meta.get("source") != null ? meta.get("source").toString()
-                    : "Unknown";
-            String chunkId = meta.get("chunk_id") != null ? meta.get("chunk_id").toString()
-                    : (meta.get("id") != null ? meta.get("id").toString() : "chunk_" + i);
-            String text = d.getText();
-            String excerpt = text.length() > 500 ? text.substring(0, 500) + "..." : text;
-            citations.add(CitationDto.builder().chunkId(chunkId).source(source).excerpt(excerpt).build());
-        }
-        return citations;
-    }
-
-    // ==================== 私有：DB 操作 ====================
 
     private void finishAssistantMessage(String assistantMessageId, String content, String status,
             String errorCode, String errorMessage,
             Integer promptTokens, Integer completionTokens, Double estimatedCostUsd) {
-        Message m = messageService.getById(assistantMessageId);
-        if (m == null)
+        com.imperium.astroguide.model.entity.Message m = messageService.getById(assistantMessageId);
+        if (m == null) {
             return;
+        }
         m.setContent(content != null ? content : "");
         m.setStatus(status);
         m.setErrorCode(errorCode);
@@ -407,8 +394,6 @@ public class ChatStreamOrchestrator {
         messageService.updateById(m);
     }
 
-    // ==================== 私有：System Prompt ====================
-
     private static String buildSystemPrompt(String difficulty, String language) {
         String langInstruction = "zh".equalsIgnoreCase(language) ? "请使用中文回答。" : "Please answer in English.";
         String diffHint = switch (difficulty.toLowerCase()) {
@@ -417,11 +402,11 @@ public class ChatStreamOrchestrator {
             default -> "Explain clearly with moderate detail.";
         };
         String formatConstraints = " Output format hard constraints (must follow strictly): "
-            + "(1) Keep one blank line before and after every Markdown heading. "
-            + "(2) Each list item must be on its own line; never place multiple list items on the same line. "
-            + "(3) Inline math must use $...$. "
-            + "(4) Block math must use $$...$$ as a standalone block. "
-            + "(5) Do a quick self-check before final output; if any rule is violated, rewrite to comply.";
+                + "(1) Keep one blank line before and after every Markdown heading. "
+                + "(2) Each list item must be on its own line; never place multiple list items on the same line. "
+                + "(3) Inline math must use $...$. "
+                + "(4) Block math must use $$...$$ as a standalone block. "
+                + "(5) Do a quick self-check before final output; if any rule is violated, rewrite to comply.";
         String markerProtocol = " For key terms or symbols, use markers: [[term:Term Name]] or [[sym:formula]]. "
                 + "Optional stable key: [[term:Name|key=id]]. "
                 + "Do not use [[...]] for anything other than term/sym markers.";
@@ -435,12 +420,11 @@ public class ChatStreamOrchestrator {
                 + markerProtocol;
     }
 
-    // ==================== 私有：工具方法 ====================
-
     private ServerSentEvent<String> sseError(String code, String message, String requestId) {
         Map<String, Object> errorMap = new HashMap<>(Map.of("code", code, "message", message));
-        if (requestId != null)
+        if (requestId != null) {
             errorMap.put("requestId", requestId);
+        }
         return ServerSentEvent.<String>builder(toJson(Map.of("status", "error", "error", errorMap)))
                 .event("error").build();
     }

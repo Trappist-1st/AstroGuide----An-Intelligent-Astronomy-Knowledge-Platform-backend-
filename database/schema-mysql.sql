@@ -11,6 +11,9 @@ SET FOREIGN_KEY_CHECKS = 0;
 -- 用户表
 -- ----------------------------
 DROP TABLE IF EXISTS `request_usage`;
+DROP TABLE IF EXISTS `agent_checkpoints`;
+DROP TABLE IF EXISTS `agent_runs`;
+DROP TABLE IF EXISTS `conversation_memory_summary`;
 DROP TABLE IF EXISTS `messages`;
 DROP TABLE IF EXISTS `term_cache`;
 DROP TABLE IF EXISTS `conversations`;
@@ -97,6 +100,59 @@ CREATE TABLE `request_usage` (
   KEY `idx_usage_message` (`message_id`),
   CONSTRAINT `fk_usage_message` FOREIGN KEY (`message_id`) REFERENCES `messages` (`id`) ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='请求用量与耗时统计';
+
+-- ----------------------------
+-- Agent 执行审计表（LangGraph Runtime）
+-- ----------------------------
+CREATE TABLE `agent_runs` (
+  `id` VARCHAR(64) NOT NULL COMMENT 'runId',
+  `request_id` VARCHAR(64) DEFAULT NULL COMMENT 'X-Request-Id',
+  `conversation_id` VARCHAR(64) NOT NULL COMMENT '会话ID',
+  `message_id` VARCHAR(64) NOT NULL COMMENT 'user 消息ID',
+  `status` VARCHAR(32) NOT NULL COMMENT 'running|completed|failed|cancelled',
+  `model` VARCHAR(64) DEFAULT NULL COMMENT '模型名',
+  `tool_calls_json` TEXT DEFAULT NULL COMMENT 'Tool 调用审计 JSON',
+  `node_timings_json` TEXT DEFAULT NULL COMMENT 'Node 耗时 JSON',
+  `prompt_tokens` INT DEFAULT NULL COMMENT 'prompt tokens',
+  `completion_tokens` INT DEFAULT NULL COMMENT 'completion tokens',
+  `latency_ms` INT DEFAULT NULL COMMENT '总耗时 ms',
+  `termination_reason` VARCHAR(64) DEFAULT NULL COMMENT '终止原因',
+  `error_message` TEXT DEFAULT NULL COMMENT '错误信息',
+  `created_at` DATETIME(3) NOT NULL COMMENT '开始时间',
+  `finished_at` DATETIME(3) DEFAULT NULL COMMENT '结束时间',
+  PRIMARY KEY (`id`),
+  KEY `idx_agent_runs_conv_created` (`conversation_id`, `created_at`),
+  KEY `idx_agent_runs_message` (`message_id`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='Agent Runtime 单次执行审计';
+
+-- ----------------------------
+-- LangGraph Checkpoint 持久化表
+-- ----------------------------
+CREATE TABLE `agent_checkpoints` (
+  `id` VARCHAR(64) NOT NULL COMMENT '行ID',
+  `thread_id` VARCHAR(128) NOT NULL COMMENT 'LangGraph threadId (conversationId:runId)',
+  `checkpoint_id` VARCHAR(64) NOT NULL COMMENT 'Checkpoint UUID',
+  `node_id` VARCHAR(64) NOT NULL COMMENT '当前 node',
+  `next_node_id` VARCHAR(64) NOT NULL COMMENT '下一个 node',
+  `state_json` LONGTEXT NOT NULL COMMENT 'AgentState JSON',
+  `created_at` DATETIME(3) NOT NULL COMMENT '创建时间',
+  PRIMARY KEY (`id`),
+  KEY `idx_agent_checkpoints_thread_created` (`thread_id`, `created_at`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='LangGraph Checkpoint 快照';
+
+-- ----------------------------
+-- 会话摘要记忆表（Summary Memory）
+-- ----------------------------
+CREATE TABLE `conversation_memory_summary` (
+  `conversation_id` VARCHAR(64) NOT NULL COMMENT '会话ID',
+  `summary` TEXT NOT NULL COMMENT '滚动摘要',
+  `message_count` INT DEFAULT NULL COMMENT '摘要覆盖消息数',
+  `version` INT NOT NULL DEFAULT 1 COMMENT '摘要版本',
+  `created_at` DATETIME(3) NOT NULL COMMENT '创建时间',
+  `updated_at` DATETIME(3) NOT NULL COMMENT '更新时间',
+  PRIMARY KEY (`conversation_id`),
+  CONSTRAINT `fk_memory_summary_conversation` FOREIGN KEY (`conversation_id`) REFERENCES `conversations` (`id`) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='会话级摘要记忆';
 
 SET FOREIGN_KEY_CHECKS = 1;
 

@@ -4,7 +4,10 @@ An intelligent astronomy knowledge platform MVP built with Spring Boot and Sprin
 
 ## Features
 
-- **AI Chat Streaming**: Real-time conversational AI with SSE (Server-Sent Events) support
+- **AI Chat Streaming**: LangGraph Agent Runtime with SSE (meta/delta/node/tool/done)
+- **Agent Workflow**: retrieve → prepare → react → finalize
+- **Tool Registry + Policy**: budget, timeout, audit
+- **Context Engineering**: history trim + RAG injection + token estimate
 - **Concept Cards**: Interactive astronomy concept explanations
 - **RAG Integration**: Knowledge retrieval from vectorized astronomy content using Qdrant
 - **Tool Calling**: Integrated tools for Wikipedia search, knowledge base queries, and concept lookups
@@ -109,14 +112,20 @@ Supported directives:
 ```
 src/main/java/com/imperium/astroguide/
 ├── controller/          # REST controllers
-├── service/             # Business logic services
-│   ├── impl/            # Service implementations
-│   └── ai/tools/        # Spring AI tools
+├── ai/
+│   ├── orchestrator/    # SSE 编排
+│   ├── runtime/         # Agent Runtime
+│   ├── graph/           # Workflow + LangGraph ReAct 子图
+│   ├── context/         # Context Engineering
+│   ├── memory/          # Session + Summary Memory (async worker)
+│   ├── multiagent/      # Router / Planner / Reviewer (Phase 3)
+│   ├── rag/             # RAG 检索
+│   └── tool/            # Tool Registry / Policy
+├── service/             # Business services
 ├── mapper/              # MyBatis mappers
 ├── model/               # DTOs and entities
-├── policy/              # Rate limiting and context policies
-├── config/              # Configuration classes
-└── AstroGuideApplication.java
+├── policy/              # Rate limiting policies
+└── config/              # Configuration classes
 ```
 
 ## Contributing
