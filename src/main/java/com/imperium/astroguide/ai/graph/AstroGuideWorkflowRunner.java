@@ -10,6 +10,8 @@ import com.imperium.astroguide.ai.multiagent.RouteDecision;
 import com.imperium.astroguide.ai.multiagent.RouteMode;
 import com.imperium.astroguide.ai.rag.RagRetrievalResult;
 import com.imperium.astroguide.ai.rag.RagRetrievalService;
+import com.imperium.astroguide.ai.runtime.AgentRunCancelledException;
+import com.imperium.astroguide.ai.runtime.AgentRunCancellationRegistry;
 import com.imperium.astroguide.ai.runtime.AgentRunContext;
 import com.imperium.astroguide.ai.runtime.AgentRunRequest;
 import com.imperium.astroguide.ai.runtime.AgentStreamEvent;
@@ -62,6 +64,7 @@ public class AstroGuideWorkflowRunner {
     private final PlannerService plannerService;
     private final AnswerReviewerService answerReviewerService;
     private final CompiledGraph<AgentExecutor.State> reactGraph;
+    private final AgentRunCancellationRegistry cancellationRegistry;
 
     public AstroGuideWorkflowRunner(ContextAssemblyService contextAssemblyService,
             RagRetrievalService ragRetrievalService,
@@ -69,7 +72,8 @@ public class AstroGuideWorkflowRunner {
             QuestionRouterService questionRouterService,
             PlannerService plannerService,
             AnswerReviewerService answerReviewerService,
-            CompiledGraph<AgentExecutor.State> reactGraph) {
+            CompiledGraph<AgentExecutor.State> reactGraph,
+            AgentRunCancellationRegistry cancellationRegistry) {
         this.contextAssemblyService = contextAssemblyService;
         this.ragRetrievalService = ragRetrievalService;
         this.toolPolicyService = toolPolicyService;
@@ -77,6 +81,7 @@ public class AstroGuideWorkflowRunner {
         this.plannerService = plannerService;
         this.answerReviewerService = answerReviewerService;
         this.reactGraph = reactGraph;
+        this.cancellationRegistry = cancellationRegistry;
     }
 
     public WorkflowExecution execute(AgentRunRequest request, Consumer<AgentStreamEvent> eventConsumer) throws Exception {
@@ -124,6 +129,9 @@ public class AstroGuideWorkflowRunner {
                 AtomicReference<String> activeNode = new AtomicReference<>();
 
                 generator.stream().forEach(output -> {
+                    if (cancellationRegistry.isCancelled(request.runId())) {
+                        throw new AgentRunCancelledException(request.runId());
+                    }
                     String nodeName = output.node() != null ? output.node() : NODE_REACT;
                     trackReactNode(metrics, activeNode, nodeName, eventConsumer);
 

@@ -4,11 +4,13 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.imperium.astroguide.ai.memory.MemoryUpdateQueue;
 import com.imperium.astroguide.ai.memory.SessionMemoryService;
 import com.imperium.astroguide.ai.memory.SummaryMemoryService;
+import com.imperium.astroguide.ai.runtime.AgentRunCancellationRegistry;
 import com.imperium.astroguide.ai.runtime.AgentRunRequest;
 import com.imperium.astroguide.ai.runtime.AgentRunResult;
 import com.imperium.astroguide.ai.runtime.AgentRuntime;
 import com.imperium.astroguide.ai.runtime.AgentStreamEvent;
 import com.imperium.astroguide.ai.tool.ToolExecutionRecord;
+import com.imperium.astroguide.infra.coordination.DistributedLock;
 import com.imperium.astroguide.model.dto.rag.CitationDto;
 import com.imperium.astroguide.model.entity.Conversation;
 import com.imperium.astroguide.policy.OutputLimitPolicy;
@@ -34,7 +36,6 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.UUID;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 
 /**
@@ -57,6 +58,11 @@ public class ChatStreamOrchestrator {
     private final SummaryMemoryService summaryMemoryService;
     private final MemoryUpdateQueue memoryUpdateQueue;
     private final MeterRegistry meterRegistry;
+    private final AgentRunCancellationRegistry cancellationRegistry;
+    private final DistributedLock distributedLock;
+
+    @Value("${app.ai.stream.lock-ttl-ms:600000}")
+    private long streamLockTtlMs;
 
     @Value("${spring.ai.openai.chat.options.model:deepseek-chat}")
     private String defaultModel;
@@ -79,7 +85,9 @@ public class ChatStreamOrchestrator {
             SessionMemoryService sessionMemoryService,
             SummaryMemoryService summaryMemoryService,
             MemoryUpdateQueue memoryUpdateQueue,
-            MeterRegistry meterRegistry) {
+            MeterRegistry meterRegistry,
+            AgentRunCancellationRegistry cancellationRegistry,
+            DistributedLock distributedLock) {
         this.conversationService = conversationService;
         this.messageService = messageService;
         this.agentRuntime = agentRuntime;
@@ -90,6 +98,8 @@ public class ChatStreamOrchestrator {
         this.summaryMemoryService = summaryMemoryService;
         this.memoryUpdateQueue = memoryUpdateQueue;
         this.meterRegistry = meterRegistry;
+        this.cancellationRegistry = cancellationRegistry;
+        this.distributedLock = distributedLock;
     }
 
     public Flux<ServerSentEvent<String>> stream(String conversationId,
@@ -140,6 +150,17 @@ public class ChatStreamOrchestrator {
         String conversationSummary = summaryMemoryService.loadSummary(conversationId);
 
         com.imperium.astroguide.model.entity.Message assistantMsg = messageService.getById(assistantMessageId);
+        if (assistantMsg != null && isTerminalMessageStatus(assistantMsg.getStatus())) {
+            incrementCounter("astroguide.chat.stream.request", "status", "conflict");
+            return Flux.just(sseError("conflict", "Assistant message already finalized", resolvedRequestId));
+        }
+
+        String streamLockKey = "stream:" + assistantMessageId;
+        if (!distributedLock.tryLock(streamLockKey, streamLockTtlMs)) {
+            incrementCounter("astroguide.chat.stream.request", "status", "conflict");
+            return Flux.just(sseError("conflict", "Stream already in progress for this message", resolvedRequestId));
+        }
+
         if (assistantMsg != null) {
             assistantMsg.setStatus("streaming");
             messageService.updateById(assistantMsg);
@@ -169,19 +190,22 @@ public class ChatStreamOrchestrator {
                         "runtime", "langgraph"))).event("meta").build());
 
         long startMs = System.currentTimeMillis();
-        StringBuilder contentAccumulator = new StringBuilder();
+        StreamContentBuffer contentBuffer = new StreamContentBuffer();
         AtomicReference<AgentRunResult> runResultRef = new AtomicReference<>();
         AtomicReference<String> reviewOverrideRef = new AtomicReference<>();
-        AtomicBoolean streamFinalized = new AtomicBoolean(false);
+        StreamTerminalState terminalState = new StreamTerminalState();
 
         return metaFlux.concatWith(Flux.defer(() -> {
             Flux<ServerSentEvent<String>> runtimeFlux = agentRuntime.stream(runRequest)
-                    .flatMap(event -> mapRuntimeEvent(event, contentAccumulator, runResultRef, reviewOverrideRef));
+                    .flatMap(event -> mapRuntimeEvent(event, contentBuffer, runResultRef, reviewOverrideRef));
 
             Flux<ServerSentEvent<String>> doneFlux = Flux.defer(() -> {
+                if (!terminalState.tryFinalize(StreamTerminalState.Status.DONE)) {
+                    return Flux.empty();
+                }
                 int latencyMs = (int) (System.currentTimeMillis() - startMs);
                 AgentRunResult result = runResultRef.get();
-                String finalContent = resolveFinalContent(contentAccumulator, reviewOverrideRef, result);
+                String finalContent = resolveFinalContent(contentBuffer, reviewOverrideRef, result);
                 Integer promptTok = result != null ? result.promptTokens() : null;
                 Integer completionTok = result != null ? result.completionTokens() : null;
                 List<CitationDto> citations = result != null && result.citations() != null
@@ -227,7 +251,7 @@ public class ChatStreamOrchestrator {
                 finishAssistantMessage(assistantMessageId, finalContent,
                         "done", null, null, promptTok, completionTok, null);
                 usageService.record(assistantMessageId, defaultModel, latencyMs, promptTok, completionTok, null);
-                markStreamFinalized(streamFinalized, "done", difficulty, latencyMs);
+                recordTerminalMetrics(terminalState, "done", difficulty, latencyMs);
                 log.info("chat stream done requestId={} runId={} conversationId={} messageId={} latencyMs={} toolCalls={}",
                         resolvedRequestId, runId, conversationId, messageId, latencyMs,
                         result != null && result.toolExecutions() != null ? result.toolExecutions().size() : 0);
@@ -238,37 +262,48 @@ public class ChatStreamOrchestrator {
             return runtimeFlux
                     .concatWith(doneFlux)
                     .onErrorResume(e -> Flux.defer(() -> {
-                        finishAssistantMessage(assistantMessageId, contentAccumulator.toString(),
+                        if (!terminalState.tryFinalize(StreamTerminalState.Status.ERROR)) {
+                            return Flux.empty();
+                        }
+                        finishAssistantMessage(assistantMessageId, contentBuffer.snapshot(),
                                 "error", "provider_error",
-                                e.getMessage() != null ? e.getMessage() : "Agent runtime failed",
+                                sanitizeClientErrorMessage(e),
                                 null, null, null);
                         int latencyMs = (int) (System.currentTimeMillis() - startMs);
-                        markStreamFinalized(streamFinalized, "error", difficulty, latencyMs);
+                        recordTerminalMetrics(terminalState, "error", difficulty, latencyMs);
                         log.warn("chat stream error requestId={} runId={} conversationId={} messageId={} latencyMs={} error={}",
                                 resolvedRequestId, runId, conversationId, messageId, latencyMs, e.getMessage());
                         return Flux.just(sseError("provider_error",
-                                e.getMessage() != null ? e.getMessage() : "Agent runtime failed", resolvedRequestId));
+                                sanitizeClientErrorMessage(e), resolvedRequestId));
                     }).subscribeOn(Schedulers.boundedElastic()))
                     .doOnCancel(() -> Schedulers.boundedElastic().schedule(() -> {
-                        finishAssistantMessage(assistantMessageId, contentAccumulator.toString(),
+                        cancellationRegistry.cancel(runId);
+                        if (!terminalState.tryFinalize(StreamTerminalState.Status.CANCELLED)) {
+                            return;
+                        }
+                        finishAssistantMessage(assistantMessageId, contentBuffer.snapshot(),
                                 "cancelled", null, null, null, null, null);
                         int latencyMs = (int) (System.currentTimeMillis() - startMs);
-                        markStreamFinalized(streamFinalized, "cancelled", difficulty, latencyMs);
+                        recordTerminalMetrics(terminalState, "cancelled", difficulty, latencyMs);
                         log.info("chat stream cancelled requestId={} runId={} conversationId={} messageId={} latencyMs={}",
                                 resolvedRequestId, runId, conversationId, messageId, latencyMs);
                     }));
-        }));
+        })).doFinally(signal -> distributedLock.unlock(streamLockKey));
+    }
+
+    private static boolean isTerminalMessageStatus(String status) {
+        return "done".equals(status) || "error".equals(status) || "cancelled".equals(status);
     }
 
     private Flux<ServerSentEvent<String>> mapRuntimeEvent(AgentStreamEvent event,
-            StringBuilder contentAccumulator,
+            StreamContentBuffer contentBuffer,
             AtomicReference<AgentRunResult> runResultRef,
             AtomicReference<String> reviewOverrideRef) {
         if (event instanceof AgentStreamEvent.TextDelta delta) {
             if (delta.text() == null || delta.text().isBlank()) {
                 return Flux.empty();
             }
-            contentAccumulator.append(delta.text());
+            contentBuffer.append(delta.text());
             return Flux.just(ServerSentEvent.<String>builder(
                     toJson(Map.of("text", delta.text()))).event("delta").build());
         }
@@ -319,7 +354,7 @@ public class ChatStreamOrchestrator {
         return Flux.empty();
     }
 
-    private static String resolveFinalContent(StringBuilder contentAccumulator,
+    private static String resolveFinalContent(StreamContentBuffer contentBuffer,
             AtomicReference<String> reviewOverrideRef,
             AgentRunResult result) {
         if (reviewOverrideRef.get() != null && !reviewOverrideRef.get().isBlank()) {
@@ -328,7 +363,18 @@ public class ChatStreamOrchestrator {
         if (result != null && result.finalText() != null && !result.finalText().isBlank()) {
             return result.finalText();
         }
-        return contentAccumulator.toString();
+        return contentBuffer.snapshot();
+    }
+
+    private static String sanitizeClientErrorMessage(Throwable e) {
+        if (e == null || e.getMessage() == null || e.getMessage().isBlank()) {
+            return "Agent runtime failed";
+        }
+        String msg = e.getMessage();
+        if (msg.length() > 200) {
+            return msg.substring(0, 200);
+        }
+        return msg;
     }
 
     private ServerSentEvent<String> validate(String conversationId, String messageId,
@@ -347,13 +393,10 @@ public class ChatStreamOrchestrator {
         return null;
     }
 
-    private void markStreamFinalized(AtomicBoolean streamFinalized,
+    private void recordTerminalMetrics(StreamTerminalState terminalState,
             String status,
             String difficulty,
             int latencyMs) {
-        if (!streamFinalized.compareAndSet(false, true)) {
-            return;
-        }
         incrementCounter("astroguide.chat.stream.terminal", "status", status);
         Timer.builder("astroguide.chat.stream.latency")
                 .tag("status", status)

@@ -6,6 +6,8 @@ import com.imperium.astroguide.model.dto.response.ConceptCardResponse;
 import com.imperium.astroguide.model.entity.TermCache;
 import com.imperium.astroguide.service.ConceptCardService;
 import com.imperium.astroguide.service.TermCacheService;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.ai.chat.client.ChatClient;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
@@ -22,8 +24,9 @@ import java.util.regex.Pattern;
 @Service
 public class ConceptCardServiceImpl implements ConceptCardService {
 
-    private static final Pattern SLUG_PATTERN = Pattern.compile("[^a-z0-9_]");
-    private static final TypeReference<Map<String, Object>> PAYLOAD_TYPE = new TypeReference<>() {};
+    private static final Logger log = LoggerFactory.getLogger(ConceptCardServiceImpl.class);
+
+    private static final Pattern SLUG_PATTERN = Pattern.compile("[^a-z0-9_]");    private static final TypeReference<Map<String, Object>> PAYLOAD_TYPE = new TypeReference<>() {};
 
     private final TermCacheService termCacheService;
     private final ChatClient chatClient;
@@ -131,7 +134,14 @@ public class ConceptCardServiceImpl implements ConceptCardService {
         }
 
         ConceptCardResponse card = parseGeneratedResponse(response, cacheKey);
-        if (card == null) return null;
+        if (card == null) {
+            return null;
+        }
+
+        TermCache raced = termCacheService.getById(cacheKey);
+        if (raced != null) {
+            return fromTermCache(raced, cacheKey);
+        }
 
         String payloadJson;
         try {
@@ -154,7 +164,15 @@ public class ConceptCardServiceImpl implements ConceptCardService {
         term.setPayloadJson(payloadJson);
         term.setCreatedAt(now);
         term.setUpdatedAt(now);
-        termCacheService.save(term);
+        try {
+            termCacheService.save(term);
+        } catch (Exception e) {
+            log.debug("concept card cache write race cacheKey={}: {}", cacheKey, e.getMessage());
+            TermCache winner = termCacheService.getById(cacheKey);
+            if (winner != null) {
+                return fromTermCache(winner, cacheKey);
+            }
+        }
         return card;
     }
 

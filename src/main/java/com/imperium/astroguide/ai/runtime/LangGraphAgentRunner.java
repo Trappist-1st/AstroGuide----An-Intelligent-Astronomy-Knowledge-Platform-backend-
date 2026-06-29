@@ -15,7 +15,7 @@ import java.util.List;
 import java.util.UUID;
 
 /**
- * LangGraph Agent Runtime：委托 {@link AstroGuideWorkflowRunner} 执行 Phase 2 工作流。
+ * LangGraph Agent Runtime：委托 {@link AstroGuideWorkflowRunner} 执行 Phase 3 工作流。
  */
 @Service
 public class LangGraphAgentRunner implements AgentRuntime {
@@ -24,13 +24,17 @@ public class LangGraphAgentRunner implements AgentRuntime {
 
     private final AstroGuideWorkflowRunner workflowRunner;
     private final AgentRunService agentRunService;
+    private final AgentRunCancellationRegistry cancellationRegistry;
 
     @Value("${spring.ai.openai.chat.options.model:deepseek-chat}")
     private String defaultModel;
 
-    public LangGraphAgentRunner(AstroGuideWorkflowRunner workflowRunner, AgentRunService agentRunService) {
+    public LangGraphAgentRunner(AstroGuideWorkflowRunner workflowRunner,
+            AgentRunService agentRunService,
+            AgentRunCancellationRegistry cancellationRegistry) {
         this.workflowRunner = workflowRunner;
         this.agentRunService = agentRunService;
+        this.cancellationRegistry = cancellationRegistry;
     }
 
     @Override
@@ -41,6 +45,7 @@ public class LangGraphAgentRunner implements AgentRuntime {
     private void run(AgentRunRequest request, FluxSink<AgentStreamEvent> sink) {
         long startMs = System.currentTimeMillis();
         String runId = request.runId() != null ? request.runId() : newRunId();
+        cancellationRegistry.register(runId);
 
         try {
             agentRunService.markRunning(runId, request.requestId(), request.conversationId(),
@@ -79,6 +84,14 @@ public class LangGraphAgentRunner implements AgentRuntime {
             agentRunService.markFinished(result, latencyMs, "completed", null);
             sink.next(new AgentStreamEvent.RunFinished(result));
             sink.complete();
+        } catch (AgentRunCancelledException e) {
+            int latencyMs = (int) (System.currentTimeMillis() - startMs);
+            AgentRunResult cancelled = new AgentRunResult(
+                    runId, "", null, null, List.of(), List.of(), java.util.Map.of(), "cancelled", null);
+            agentRunService.markFinished(cancelled, latencyMs, "cancelled", null);
+            log.info("agent run cancelled runId={} conversationId={} messageId={}",
+                    runId, request.conversationId(), request.messageId());
+            sink.complete();
         } catch (Exception e) {
             int latencyMs = (int) (System.currentTimeMillis() - startMs);
             AgentRunResult failed = new AgentRunResult(
@@ -87,6 +100,8 @@ public class LangGraphAgentRunner implements AgentRuntime {
             log.warn("agent run failed runId={} conversationId={} messageId={} error={}",
                     runId, request.conversationId(), request.messageId(), e.getMessage(), e);
             sink.error(e);
+        } finally {
+            cancellationRegistry.unregister(runId);
         }
     }
 

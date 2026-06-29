@@ -1,5 +1,6 @@
 package com.imperium.astroguide.ai.memory;
 
+import com.imperium.astroguide.infra.coordination.DistributedLock;
 import com.imperium.astroguide.mapper.ConversationMemorySummaryMapper;
 import com.imperium.astroguide.model.entity.ConversationMemorySummary;
 import com.imperium.astroguide.model.entity.Message;
@@ -17,11 +18,14 @@ import java.util.stream.Collectors;
 
 /**
  * 异步 Summary Memory Worker：对话结束后压缩早期轮次，不阻塞 SSE 主链路。
+ * <p>
+ * 多实例下通过 {@link DistributedLock} 保证同一会话仅一个实例执行摘要。
  */
 @Service
 public class SummaryMemoryWorker {
 
     private static final Logger log = LoggerFactory.getLogger(SummaryMemoryWorker.class);
+    private static final String LOCK_PREFIX = "summary:";
 
     private static final String SUMMARY_PROMPT = """
             Summarize the following astronomy tutoring conversation in 3-6 sentences.
@@ -33,23 +37,45 @@ public class SummaryMemoryWorker {
     private final MessageService messageService;
     private final ConversationMemorySummaryMapper summaryMapper;
     private final ChatClient chatClient;
+    private final DistributedLock distributedLock;
     private final int minMessagesToSummarize;
     private final int maxMessagesInWindow;
+    private final long lockTtlMs;
 
     public SummaryMemoryWorker(MessageService messageService,
             ConversationMemorySummaryMapper summaryMapper,
             ChatClient chatClient,
+            DistributedLock distributedLock,
             @Value("${app.ai.memory.summary-min-messages:6}") int minMessagesToSummarize,
-            @Value("${app.ai.memory.summary-window:24}") int maxMessagesInWindow) {
+            @Value("${app.ai.memory.summary-window:24}") int maxMessagesInWindow,
+            @Value("${app.ai.memory.summary-lock-ttl-ms:120000}") long lockTtlMs) {
         this.messageService = messageService;
         this.summaryMapper = summaryMapper;
         this.chatClient = chatClient;
+        this.distributedLock = distributedLock;
         this.minMessagesToSummarize = minMessagesToSummarize;
         this.maxMessagesInWindow = maxMessagesInWindow;
+        this.lockTtlMs = lockTtlMs;
     }
 
     @Async("memoryTaskExecutor")
     public void summarizeConversation(String conversationId) {
+        if (conversationId == null || conversationId.isBlank()) {
+            return;
+        }
+        String lockKey = LOCK_PREFIX + conversationId;
+        if (!distributedLock.tryLock(lockKey, lockTtlMs)) {
+            log.debug("skip summary, lock held conversationId={}", conversationId);
+            return;
+        }
+        try {
+            doSummarize(conversationId);
+        } finally {
+            distributedLock.unlock(lockKey);
+        }
+    }
+
+    private void doSummarize(String conversationId) {
         List<Message> messages = messageService.lambdaQuery()
                 .eq(Message::getConversationId, conversationId)
                 .in(Message::getRole, "user", "assistant")

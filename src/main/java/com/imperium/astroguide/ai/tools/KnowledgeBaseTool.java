@@ -9,6 +9,9 @@ import org.springframework.ai.vectorstore.VectorStore;
 import org.springframework.lang.Nullable;
 import org.springframework.stereotype.Component;
 
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
@@ -19,6 +22,8 @@ import java.util.Map;
  */
 @Component
 public class KnowledgeBaseTool {
+
+    private static final Logger log = LoggerFactory.getLogger(KnowledgeBaseTool.class);
 
     @Nullable
     private final VectorStore vectorStore;
@@ -39,7 +44,13 @@ public class KnowledgeBaseTool {
 
         int k = (topK != null && topK > 0) ? topK : 8;
         SearchRequest searchRequest = SearchRequest.builder().query(query).topK(k).build();
-        List<org.springframework.ai.document.Document> docs = vectorStore.similaritySearch(searchRequest);
+        List<org.springframework.ai.document.Document> docs;
+        try {
+            docs = vectorStore.similaritySearch(searchRequest);
+        } catch (Exception e) {
+            log.warn("Knowledge base search failed query={}: {}", query, e.getMessage());
+            return RagRetrieveResult.empty();
+        }
         if (docs == null || docs.isEmpty()) {
             return RagRetrieveResult.empty();
         }

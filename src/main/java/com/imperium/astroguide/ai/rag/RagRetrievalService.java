@@ -2,6 +2,8 @@ package com.imperium.astroguide.ai.rag;
 
 import com.imperium.astroguide.ai.context.ContextTrimPolicy;
 import com.imperium.astroguide.model.dto.rag.CitationDto;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.ai.document.Document;
 import org.springframework.ai.vectorstore.SearchRequest;
 import org.springframework.ai.vectorstore.VectorStore;
@@ -19,6 +21,8 @@ import java.util.Map;
  */
 @Service
 public class RagRetrievalService {
+
+    private static final Logger log = LoggerFactory.getLogger(RagRetrievalService.class);
 
     @Nullable
     private final VectorStore vectorStore;
@@ -38,8 +42,14 @@ public class RagRetrievalService {
             return RagRetrievalResult.empty();
         }
 
-        List<Document> docs = vectorStore.similaritySearch(
-                SearchRequest.builder().query(userText).topK(ragTopK).build());
+        List<Document> docs;
+        try {
+            docs = vectorStore.similaritySearch(
+                    SearchRequest.builder().query(userText).topK(ragTopK).build());
+        } catch (Exception e) {
+            log.warn("RAG retrieval failed, degrading to empty context: {}", e.getMessage());
+            return RagRetrievalResult.empty();
+        }
         if (CollectionUtils.isEmpty(docs)) {
             return RagRetrievalResult.empty();
         }

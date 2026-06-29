@@ -48,9 +48,19 @@ spring:
         initialize-schema: ${QDRANT_INITIALIZE_SCHEMA:true}
         # 客户端(1.16.0) 与服务端(1.16.x) 版本已对齐；此开关可防止未来小版本漂移时再报 WARN
         check-compatibility: false
+  data:
+    redis:
+      host: ${REDIS_HOST:localhost}
+      port: ${REDIS_PORT:6379}
+      password: ${REDIS_PASSWORD:}
 
 # Concept Card：未命中时是否调用 LLM 生成并缓存（默认 false，仅查缓存）
 app:
+  redis:
+    enabled: ${APP_REDIS_ENABLED:false}
+  rate-limit:
+    window-ms: ${APP_RATE_LIMIT_WINDOW_MS:600000}
+    max-requests: ${APP_RATE_LIMIT_MAX_REQUESTS:20}
   # 跨域：允许的前端来源，多个用逗号分隔（默认 Vite dev 端口）
   cors:
     allowed-origins: ${CORS_ALLOWED_ORIGINS:http://localhost:5173}
@@ -69,6 +79,8 @@ app:
       emit-node-events: ${APP_AI_RUNTIME_EMIT_NODE_EVENTS:true}
       emit-tool-events: ${APP_AI_RUNTIME_EMIT_TOOL_EVENTS:true}
       emit-route-events: ${APP_AI_RUNTIME_EMIT_ROUTE_EVENTS:true}
+    stream:
+      lock-ttl-ms: ${APP_AI_STREAM_LOCK_TTL_MS:600000}
     context:
       max-rounds: ${APP_AI_CONTEXT_MAX_ROUNDS:8}
       max-history-chars: ${APP_AI_CONTEXT_MAX_HISTORY_CHARS:12000}
@@ -77,6 +89,7 @@ app:
       summary-debounce-ms: ${APP_AI_MEMORY_SUMMARY_DEBOUNCE_MS:5000}
       summary-min-messages: ${APP_AI_MEMORY_SUMMARY_MIN_MESSAGES:6}
       summary-window: ${APP_AI_MEMORY_SUMMARY_WINDOW:24}
+      summary-lock-ttl-ms: ${APP_AI_MEMORY_SUMMARY_LOCK_TTL_MS:120000}
     router:
       enabled: ${APP_AI_ROUTER_ENABLED:true}
       complex-min-chars: ${APP_AI_ROUTER_COMPLEX_MIN_CHARS:120}

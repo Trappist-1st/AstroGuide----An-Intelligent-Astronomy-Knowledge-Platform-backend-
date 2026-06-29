@@ -2,6 +2,8 @@ package com.imperium.astroguide.controller;
 
 import com.imperium.astroguide.config.RequestIdSupport;
 import jakarta.servlet.http.HttpServletRequest;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.context.request.RequestContextHolder;
@@ -14,10 +16,12 @@ import java.util.HashMap;
 import java.util.Map;
 
 /**
- * 全局校验异常处理：@Valid 失败时按 TDD 5.0.5 返回 error 结构。
+ * 全局异常处理：校验失败与未捕获 REST 异常。
  */
 @RestControllerAdvice
 public class GlobalValidationExceptionHandler {
+
+    private static final Logger log = LoggerFactory.getLogger(GlobalValidationExceptionHandler.class);
 
     @ExceptionHandler(MethodArgumentNotValidException.class)
     public ResponseEntity<Map<String, Object>> handleValidation(MethodArgumentNotValidException ex) {
@@ -38,6 +42,16 @@ public class GlobalValidationExceptionHandler {
             err.put("details", Map.of("field", field));
         }
         return ResponseEntity.status(HttpStatus.BAD_REQUEST).body(Map.of("error", err));
+    }
+
+    @ExceptionHandler(Exception.class)
+    public ResponseEntity<Map<String, Object>> handleUnexpected(Exception ex) {
+        log.error("Unhandled REST exception requestId={}", resolveRequestId(), ex);
+        Map<String, Object> err = new HashMap<>();
+        err.put("code", "internal_error");
+        err.put("message", "Internal server error");
+        err.put("requestId", resolveRequestId());
+        return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).body(Map.of("error", err));
     }
 
     private static String resolveRequestId() {

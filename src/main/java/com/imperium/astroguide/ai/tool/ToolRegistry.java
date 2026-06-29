@@ -5,6 +5,7 @@ import com.imperium.astroguide.ai.tools.KnowledgeBaseTool;
 import com.imperium.astroguide.ai.tools.WikipediaTool;
 import org.springframework.ai.support.ToolCallbacks;
 import org.springframework.ai.tool.ToolCallback;
+import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Component;
 
@@ -14,6 +15,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.concurrent.Executor;
 
 /**
  * Tool 注册中心：集中管理 Tool 元数据，并输出带 Policy 包装的可执行回调。
@@ -23,6 +25,7 @@ public class ToolRegistry {
 
     private final Map<String, ToolDefinition> definitions = new LinkedHashMap<>();
     private final Map<String, ToolCallback> rawCallbacks = new LinkedHashMap<>();
+    private final Executor toolExecutor;
 
     @Value("${app.ai.tools.enabled:true}")
     private boolean toolsEnabled;
@@ -30,8 +33,10 @@ public class ToolRegistry {
     public ToolRegistry(WikipediaTool wikipediaTool,
             KnowledgeBaseTool knowledgeBaseTool,
             ConceptCardTool conceptCardTool,
+            @Qualifier("toolTaskExecutor") Executor toolExecutor,
             @Value("${app.ai.tools.timeout-ms:3000}") int defaultTimeoutMs,
             @Value("${app.ai.tools.max-calls-per-tool:2}") int defaultMaxCallsPerTool) {
+        this.toolExecutor = toolExecutor;
         registerFromObject(wikipediaTool, ToolDefinition.builder()
                 .name("search_wikipedia")
                 .description("Wikipedia astronomy background search")
@@ -78,7 +83,7 @@ public class ToolRegistry {
         List<ToolCallback> wrapped = new ArrayList<>();
         for (Map.Entry<String, ToolCallback> entry : rawCallbacks.entrySet()) {
             ToolDefinition definition = definitions.get(entry.getKey());
-            wrapped.add(new PolicyEnforcingToolCallback(entry.getValue(), definition));
+            wrapped.add(new PolicyEnforcingToolCallback(entry.getValue(), definition, toolExecutor));
         }
         return wrapped;
     }

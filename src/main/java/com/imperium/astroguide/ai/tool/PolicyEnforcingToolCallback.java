@@ -6,6 +6,7 @@ import org.springframework.ai.tool.ToolCallback;
 import org.springframework.ai.tool.definition.ToolDefinition;
 
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.Executor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 
@@ -16,11 +17,14 @@ public final class PolicyEnforcingToolCallback implements ToolCallback {
 
     private final ToolCallback delegate;
     private final com.imperium.astroguide.ai.tool.ToolDefinition policyDefinition;
+    private final Executor toolExecutor;
 
     public PolicyEnforcingToolCallback(ToolCallback delegate,
-            com.imperium.astroguide.ai.tool.ToolDefinition policyDefinition) {
+            com.imperium.astroguide.ai.tool.ToolDefinition policyDefinition,
+            Executor toolExecutor) {
         this.delegate = delegate;
         this.policyDefinition = policyDefinition;
+        this.toolExecutor = toolExecutor;
     }
 
     @Override
@@ -50,7 +54,7 @@ public final class PolicyEnforcingToolCallback implements ToolCallback {
         long startMs = System.currentTimeMillis();
         try {
             String result = CompletableFuture
-                    .supplyAsync(() -> delegate.call(toolInput))
+                    .supplyAsync(() -> delegate.call(toolInput), toolExecutor)
                     .orTimeout(policyDefinition.getTimeoutMs(), TimeUnit.MILLISECONDS)
                     .join();
             ctx.recordToolCall(toolName);
@@ -75,8 +79,15 @@ public final class PolicyEnforcingToolCallback implements ToolCallback {
                     .resultPreview("")
                     .errorMessage(error)
                     .build()));
-            return "{\"error\":\"" + error + "\"}";
+            return "{\"error\":\"" + escapeJson(error) + "\"}";
         }
+    }
+
+    private static String escapeJson(String text) {
+        if (text == null) {
+            return "";
+        }
+        return text.replace("\\", "\\\\").replace("\"", "\\\"");
     }
 
     private static String truncate(String text, int maxLen) {

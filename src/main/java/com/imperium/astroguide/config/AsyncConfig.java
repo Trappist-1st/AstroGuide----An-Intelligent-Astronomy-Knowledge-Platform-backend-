@@ -14,10 +14,21 @@ public class AsyncConfig {
     @Bean(name = "memoryTaskExecutor")
     public Executor memoryTaskExecutor() {
         ThreadPoolTaskExecutor executor = new ThreadPoolTaskExecutor();
-        executor.setCorePoolSize(1);
-        executor.setMaxPoolSize(2);
-        executor.setQueueCapacity(32);
+        executor.setCorePoolSize(2);
+        executor.setMaxPoolSize(4);
+        executor.setQueueCapacity(64);
         executor.setThreadNamePrefix("memory-worker-");
+        executor.initialize();
+        return executor;
+    }
+
+    @Bean(name = "toolTaskExecutor")
+    public Executor toolTaskExecutor() {
+        ThreadPoolTaskExecutor executor = new ThreadPoolTaskExecutor();
+        executor.setCorePoolSize(4);
+        executor.setMaxPoolSize(16);
+        executor.setQueueCapacity(128);
+        executor.setThreadNamePrefix("tool-exec-");
         executor.initialize();
         return executor;
     }
